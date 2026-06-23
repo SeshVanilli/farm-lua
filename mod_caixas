@@ -1,0 +1,435 @@
+-- ===================================================================
+--  mod_caixas.lua  –  ShoxFarm módulo Juntar/Abrir Caixas
+--  Recebe ctx (tabela compartilhada com U = mod_utils)
+--  Retorna API pública: { enable, disable, isJuntando, isAbrindo,
+--                         onShowDialog, onConnect, drawGuiJuntar,
+--                         drawGuiAbrir, getGenCounter, corContador }
+-- ===================================================================
+
+local function load(ctx)
+    local U     = ctx.U
+    local imgui = require 'imgui'
+
+    -- ==================== CONFIG ====================
+    local CFG = {
+        limit               = 55,
+        actionDelay         = 1000,
+        openDelay           = 1000,
+        watchdog            = 3000,
+        maxRetries          = 4,
+        recoverDelay        = 1000,
+        maxRecoveries       = 8,
+        breatherEvery       = 15,
+        breatherDuration    = 4000,
+        tempoReconnect      = 5000,
+        dialogCheckDelay    = 8000,
+        restartDelay        = 3000,
+        actionJitter        = 400,
+        openJitter          = 400,
+        maxActions          = 4000,
+        suppress            = true,
+        hideDialogs         = false,
+    }
+
+    local LIMITE_VERDE   = 75
+    local LIMITE_LARANJA = 85
+    local LIMITE_CRITICO = 85
+
+    local GTA_EXE_PATH = [[C:\Program Files (x86)\Rockstar Games\GTA San Andreas\gta_sa.exe]]
+    local ESTADO_FILE  = os.getenv("USERPROFILE") .. "\\shoxfarm_state.txt"
+
+    local CAIXAS_ABRIR = {
+        {name="Caixa", rarity=""},
+        {name="Pacote", rarity=""},
+    }
+
+    -- ==================== ESTADO ====================
+    local junt_mode      = nil
+    local abrir_mode     = nil
+    local junt_busy      = false
+    local actionCount    = 0
+    local abrir_actionCount = 0
+    local recoveryCount  = 0
+    local abrir_recoveryCount = 0
+    local actionsSinceBreather = 0
+    local abrir_actionsSinceBreather = 0
+    local dialogGen      = 0
+    local genCounter     = 0
+    local dialogsSinceRest = 0
+    local serverIp       = nil
+    local serverPort     = nil
+    local reconectandoEmergencia = false
+    local reconectandoPreventivo = false
+    local modoAntesEmergencia    = nil
+    local emFlush        = false
+
+    local checkReconectJuntar = imgui.ImBool(true)
+    local checkReconectAbrir  = imgui.ImBool(true)
+
+    -- ==================== HELPERS ====================
+    local function junt_log(msg)  U.log('Juntar', msg, 0xFFAA00) end
+    local function abrir_log(msg) U.log('Abrir',  msg, 0xFF5500) end
+
+    local function corContador(count)
+        if count < LIMITE_VERDE then
+            return imgui.ImVec4(0.20, 0.85, 0.30, 1.0)
+        elseif count < LIMITE_LARANJA then
+            return imgui.ImVec4(1.00, 0.55, 0.00, 1.0)
+        else
+            if math.floor(getGameTimer() / 250) % 2 == 0 then
+                return imgui.ImVec4(1.00, 0.10, 0.10, 1.0)
+            else
+                return imgui.ImVec4(0.55, 0.00, 0.00, 1.0)
+            end
+        end
+    end
+
+    local function saveState(modo, ip, port)
+        local f = io.open(ESTADO_FILE, 'w')
+        if f then f:write(modo .. '\n' .. (ip or '') .. '\n' .. tostring(port or '')); f:close() end
+    end
+
+    local function loadState()
+        local f = io.open(ESTADO_FILE, 'r')
+        if not f then return nil end
+        local modo = f:read('*l'); local ip = f:read('*l'); local port = f:read('*l'); f:close()
+        if modo and modo ~= '' then
+            os.remove(ESTADO_FILE)
+            return modo, ip, (tonumber(port) or nil)
+        end
+        return nil
+    end
+
+    local function restartGame()
+        junt_log('Reiniciando jogo...')
+        local si = ffi.new('STARTUPINFOA'); si.cb = ffi.sizeof(si)
+        local pi = ffi.new('PROCESS_INFORMATION')
+        local cmd = ffi.new('char[512]', GTA_EXE_PATH)
+        U.kernel32.CreateProcessA(nil, cmd, nil, nil, 0, 0, nil, nil, si, pi)
+        wait(500)
+        U.kernel32.ExitProcess(0)
+    end
+
+    local function matchItem(nome, rarity, lista)
+        for _, v in ipairs(lista) do
+            if nome:find(v.name, 1, true) then return true end
+        end
+        return false
+    end
+
+    local function parseInventory(text)
+        local items = {}
+        for linha in (text .. '\n'):gmatch('(.-)[\r\n]+') do
+            local nome, qty = linha:match('^(.-)%s+%((%d+)%)')
+            if not nome then nome = linha:match('^(.-)%s*$') end
+            local qtdN = tonumber(qty)
+            if nome and nome ~= '' then
+                table.insert(items, {name=nome, qty=qtdN})
+            end
+        end
+        return items
+    end
+
+    -- forward ref
+    local openInventoryWatch
+
+    local function disable(motivo)
+        junt_mode = nil; abrir_mode = nil; junt_busy = false
+        junt_log(motivo or 'Desativado.')
+    end
+
+    local function flushEmergencia()
+        if emFlush then return true end
+        emFlush = true
+        junt_log('Limite critico (' .. dialogGen .. '/' .. LIMITE_CRITICO .. '). ESC flush...')
+        U.pressKeyEsc(); wait(150); U.pressKeyEsc(); wait(2000)
+        dialogGen = 0; genCounter = 0; emFlush = false
+        if junt_mode or abrir_mode then
+            lua_thread.create(function() wait(300); openInventoryWatch() end)
+        end
+        return true
+    end
+
+    local function handleInventoryList(dialogId, text, modoAtivo)
+        if modoAtivo == 'juntar' then
+            local items = parseInventory(text)
+            local alvo  = nil
+            for i, item in ipairs(items) do
+                if item.qty and item.qty >= 2 then alvo = {idx=i-1, item=item}; break end
+            end
+            if not alvo then
+                junt_log('Nenhum item a juntar. Encerrando.')
+                disable('Sem itens para juntar.'); U.pressKeyEsc(); return
+            end
+            wait(U.jitter(CFG.actionDelay, CFG.actionJitter))
+            sampSetCurrentDialogListItem(alvo.idx); wait(50)
+            sampSendDialogResponse(dialogId, 1, alvo.idx, '')
+            actionCount = actionCount + 1; genCounter = dialogGen; alvo = nil
+
+        elseif modoAtivo == 'abrir' then
+            local items = parseInventory(text)
+            local alvo  = nil
+            for i, item in ipairs(items) do
+                if matchItem(item.name, item.rarity or '', CAIXAS_ABRIR) then
+                    alvo = {idx=i-1, item=item}; break
+                end
+            end
+            if not alvo then
+                abrir_log('Nenhuma caixa no inventario. Encerrando.')
+                disable('Sem caixas para abrir.'); U.pressKeyEsc(); return
+            end
+            wait(U.jitter(CFG.actionDelay, CFG.actionJitter))
+            sampSetCurrentDialogListItem(alvo.idx); wait(50)
+            sampSendDialogResponse(dialogId, 1, alvo.idx, '')
+            actionCount = actionCount + 1; abrir_actionCount = abrir_actionCount + 1
+            genCounter = dialogGen; alvo = nil
+        end
+    end
+
+    local function handleItemMenu(dialogId, text, modoAtivo)
+        wait(U.jitter(CFG.actionDelay, CFG.actionJitter))
+        sampSetCurrentDialogListItem(0); wait(50)
+        sampSendDialogResponse(dialogId, 1, 0, '')
+    end
+
+    local function handleMergeTarget(dialogId, text)
+        wait(U.jitter(CFG.actionDelay, CFG.actionJitter))
+        sampSetCurrentDialogListItem(0); wait(50)
+        sampSendDialogResponse(dialogId, 1, 0, '')
+    end
+
+    local function handleBoxOpened(dialogId, modoAtivo)
+        wait(U.jitter(CFG.openDelay, CFG.openJitter))
+        sampSendDialogResponse(dialogId, 1, 0, '')
+        if (checkReconectJuntar.v or checkReconectAbrir.v) and dialogGen >= CFG.limit then
+            junt_log('Limite de dialogs atingido (' .. dialogGen .. '). Reconectando...')
+            reconectandoEmergencia = true; modoAntesEmergencia = modoAtivo
+            wait(500); disable('Reconectando preventivamente...')
+            wait(CFG.tempoReconnect)
+            if serverIp and serverPort then sampConnectToServer(serverIp, serverPort) end
+            return
+        end
+        lua_thread.create(function()
+            wait(U.jitter(CFG.openDelay, CFG.openJitter))
+            if junt_mode or abrir_mode then U.pressKeyN() end
+        end)
+    end
+
+    openInventoryWatch = function()
+        local genAntes = dialogGen
+        U.pressKeyN()
+        lua_thread.create(function()
+            wait(CFG.watchdog + 500)
+            if dialogGen == genAntes and (junt_mode or abrir_mode) then
+                junt_log('Inventario nao abriu. Tentando novamente...')
+                lua_thread.create(function() wait(500); openInventoryWatch() end)
+            end
+        end)
+    end
+
+    -- ==================== API PÚBLICA ====================
+    local M = {}
+
+    function M.enableJuntar()
+        junt_mode = 'juntar'; junt_busy = false
+        actionCount = 0; recoveryCount = 0; actionsSinceBreather = 0; dialogsSinceRest = 0
+        dialogGen = 0; genCounter = 0
+        junt_log('Modo JUNTAR ativado!')
+        lua_thread.create(function() wait(800); openInventoryWatch() end)
+    end
+
+    function M.enableAbrir()
+        abrir_mode = 'abrir'; junt_busy = false
+        actionCount = 0; abrir_actionCount = 0; recoveryCount = 0
+        abrir_recoveryCount = 0; abrir_actionsSinceBreather = 0; dialogsSinceRest = 0
+        dialogGen = 0; genCounter = 0
+        abrir_log('Modo ABRIR ativado!')
+        lua_thread.create(function() wait(800); openInventoryWatch() end)
+    end
+
+    function M.disable(motivo) disable(motivo) end
+    function M.isJuntando() return junt_mode ~= nil end
+    function M.isAbrindo() return abrir_mode ~= nil end
+    function M.getGenCounter() return genCounter end
+    function M.corContador(c) return corContador(c) end
+    function M.getActionCount() return actionCount end
+    function M.getAbrirActionCount() return abrir_actionCount end
+
+    function M.tryRestoreState()
+        local savedMode, savedIp, savedPort = loadState()
+        if savedMode then
+            junt_log('Estado restaurado apos restart: modo=' .. savedMode)
+            modoAntesEmergencia    = savedMode
+            reconectandoEmergencia = true
+            if savedIp and savedPort then
+                serverIp = savedIp; serverPort = savedPort
+            end
+        end
+    end
+
+    -- Retorna true se suprimiu o dialog
+    function M.onShowDialog(dialogId, style, tituloLimpo, textoDialog)
+        local modoAtivo = junt_mode or abrir_mode
+        if not modoAtivo then return false end
+
+        dialogGen  = dialogGen + 1
+        genCounter = dialogGen
+
+        if dialogGen >= LIMITE_CRITICO then
+            lua_thread.create(flushEmergencia); return true
+        end
+
+        if tituloLimpo:find('Inventario', 1, true) or tituloLimpo == '' then
+            lua_thread.create(function()
+                wait(U.jitter(CFG.actionDelay, CFG.actionJitter))
+                handleInventoryList(dialogId, textoDialog, modoAtivo)
+            end)
+            if CFG.hideDialogs then return true end
+            return false
+        end
+
+        if tituloLimpo:find('Item Selecionado:', 1, true) then
+            lua_thread.create(function()
+                wait(U.jitter(CFG.actionDelay, CFG.actionJitter))
+                handleItemMenu(dialogId, textoDialog, modoAtivo)
+            end)
+            if CFG.suppress then return true end
+            return false
+        end
+
+        if tituloLimpo:find('Item Selecionado', 1, true) then
+            lua_thread.create(function()
+                wait(U.jitter(CFG.actionDelay, CFG.actionJitter))
+                handleMergeTarget(dialogId, textoDialog)
+            end)
+            if CFG.hideDialogs then return true end
+            return false
+        end
+
+        if tituloLimpo:find('Caixa Aberta', 1, true) or tituloLimpo:find('Item Obtido', 1, true) then
+            lua_thread.create(function() handleBoxOpened(dialogId, modoAtivo) end)
+            if CFG.suppress then return true end
+            return false
+        end
+
+        return false
+    end
+
+    function M.onConnect(ip, port)
+        serverIp = ip; serverPort = port
+        dialogGen = 0; reconectandoPreventivo = false
+
+        if reconectandoEmergencia then
+            reconectandoEmergencia = false
+            local savedMode = modoAntesEmergencia; modoAntesEmergencia = nil
+            junt_log('Reconectado! Testando dialogs em ' .. (CFG.dialogCheckDelay/1000) .. 's...')
+            lua_thread.create(function()
+                wait(CFG.dialogCheckDelay)
+                local genAntes = dialogGen
+                U.pressKeyN(); wait(CFG.watchdog + 500)
+                if dialogGen ~= genAntes then
+                    junt_log('Dialogs OK! Retomando modo ' .. tostring(savedMode) .. '...')
+                    U.pressKeyEsc(); wait(600)
+                    if savedMode == 'juntar' then
+                        M.enableJuntar()
+                    elseif savedMode == 'abrir' then
+                        M.enableAbrir()
+                    end
+                else
+                    junt_log('Dialogs travados. Reiniciando jogo...')
+                    if savedMode and serverIp and serverPort then
+                        saveState(savedMode, serverIp, tostring(serverPort))
+                    end
+                    wait(CFG.restartDelay); restartGame()
+                end
+            end)
+        end
+    end
+
+    function M.drawGuiJuntar(W)
+        imgui.Text("")
+        U.warnText("AVISO: Va em /config > Inventario > Dialog")
+        U.warnText("AVISO 2: Flush automatico (ESC) ao chegar em 85 dialogs.")
+        imgui.Text("------------------------------------------------")
+        imgui.SetCursorPosX(20)
+        imgui.Checkbox("Desconectar preventivamente ao atingir 79 dialogs", checkReconectJuntar)
+        imgui.Text("")
+        if junt_mode then
+            imgui.SetCursorPosX(20)
+            imgui.Text("Acoes: " .. actionCount)
+            imgui.SetCursorPosX(20)
+            imgui.Text("Dialogs: ")
+            imgui.SameLine()
+            imgui.PushStyleColor(imgui.Col.Text, corContador(genCounter))
+            imgui.Text(genCounter .. " / 85")
+            imgui.PopStyleColor()
+        end
+        imgui.Text("")
+        local bw = W - 40; local bh = 44
+        imgui.SetCursorPosX(20)
+        if junt_mode then
+            if U.colorBtn("  PARAR DE JUNTAR  ", bw, bh, 0.08,0.55,0.15, 0.10,0.70,0.20) then
+                M.disable("Parado pela GUI."); U.pressKeyEsc()
+            end
+        else
+            if U.colorBtn("  JUNTAR CAIXAS  ", bw, bh, 0.65,0.05,0.05, 0.80,0.10,0.10) then
+                M.enableJuntar()
+            end
+        end
+    end
+
+    function M.drawGuiAbrir(W)
+        imgui.Text("")
+        U.warnText("AVISO: Va em /config > Inventario > Dialog")
+        U.warnText("AVISO 2: Flush automatico (ESC) ao chegar em 85 dialogs.")
+        imgui.Text("------------------------------------------------")
+        imgui.SetCursorPosX(20)
+        imgui.Checkbox("Desconectar preventivamente ao atingir 79 dialogs", checkReconectAbrir)
+        imgui.Text("")
+        if abrir_mode then
+            imgui.SetCursorPosX(20)
+            imgui.Text("Acoes: " .. abrir_actionCount)
+            imgui.SetCursorPosX(20)
+            imgui.Text("Dialogs: ")
+            imgui.SameLine()
+            imgui.PushStyleColor(imgui.Col.Text, corContador(genCounter))
+            imgui.Text(genCounter .. " / 85")
+            imgui.PopStyleColor()
+        end
+        imgui.Text("")
+        local bw = W - 40; local bh = 44
+        imgui.SetCursorPosX(20)
+        if abrir_mode then
+            if U.colorBtn("  PARAR DE ABRIR  ", bw, bh, 0.08,0.55,0.15, 0.10,0.70,0.20) then
+                abrir_mode = nil; M.disable("Parado pela GUI."); U.pressKeyEsc()
+            end
+        else
+            if U.colorBtn("  ABRIR CAIXAS  ", bw, bh, 0.65,0.05,0.05, 0.80,0.10,0.10) then
+                M.enableAbrir()
+            end
+        end
+    end
+
+    -- HUD overlay (chamado no final do OnDrawFrame)
+    function M.drawHud()
+        if junt_mode == nil and abrir_mode == nil then return end
+        local sw, sh = getScreenResolution()
+        imgui.SetNextWindowPos(imgui.ImVec2(sw - 160, sh - 80), imgui.Cond.Always)
+        imgui.SetNextWindowSize(imgui.ImVec2(150, 50), imgui.Cond.Always)
+        imgui.PushStyleColor(imgui.Col.WindowBg, imgui.ImVec4(0, 0, 0, 0.65))
+        imgui.Begin("##hud_gen", nil,
+            imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize +
+            imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoCollapse +
+            imgui.WindowFlags.NoInputs + imgui.WindowFlags.NoNav +
+            imgui.WindowFlags.NoBringToFrontOnFocus)
+        imgui.PushStyleColor(imgui.Col.Text, corContador(genCounter))
+        imgui.Text("dialogs: " .. genCounter .. "/85")
+        imgui.PopStyleColor()
+        imgui.End()
+        imgui.PopStyleColor()
+    end
+
+    return M
+end
+
+return load
