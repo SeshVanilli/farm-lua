@@ -9,7 +9,7 @@ local M = {}
 local ffi      = require 'ffi'
 local imgui    = require 'imgui'
 
-ffi.cdef[[
+pcall(ffi.cdef, [[
     void keybd_event(uint8_t bVk, uint8_t bScan, uint32_t dwFlags, uintptr_t dwExtraInfo);
     typedef struct _STARTUPINFOA {
         uint32_t cb; char* lpReserved; char* lpDesktop; char* lpTitle;
@@ -24,7 +24,7 @@ ffi.cdef[[
     int CreateProcessA(const char*, char*, void*, void*, int, uint32_t, void*,
                        const char*, STARTUPINFOA*, PROCESS_INFORMATION*);
     void ExitProcess(uint32_t uExitCode);
-]]
+]])
 M.user32   = ffi.load("user32")
 M.kernel32 = ffi.load("kernel32")
 
