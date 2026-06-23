@@ -1,0 +1,243 @@
+-- ===================================================================
+--  mod_recolher.lua  –  ShoxFarm módulo RecolherDrogas
+--  Recebe ctx (tabela compartilhada com U = mod_utils)
+--  Retorna API pública: { iniciarDroga, stop, isAtivo, onShowDialog, drawGui }
+-- ===================================================================
+
+local function load(ctx)
+    local U     = ctx.U
+    local imgui = require 'imgui'
+
+    -- ==================== CONFIG ====================
+    local CFG = {
+        quantidade               = "100",
+        maxCiclos                = 35,
+        cooldownWait             = 9000,
+        waitAposF                = 1500,
+        waitAposSelectPegar      = 1500,
+        waitAposDialogPegar      = 1500,
+        waitAposDialogEsconder   = 1500,
+        waitAposEnter            = 1500,
+        waitAposSelectEsconder   = 1500,
+        timeoutDialog            = 8000,
+    }
+    CFG.tituloTerritorio = "Territorio Gangster"
+
+    local ESTADO = {
+        AGUARDANDO_F1       = "aguardando_f1",
+        AGUARDANDO_PEGAR    = "aguardando_pegar",
+        AGUARDANDO_F2       = "aguardando_f2",
+        AGUARDANDO_ESCONDER = "aguardando_esconder",
+    }
+
+    local DROGAS = {
+        [1] = { nome = "Maconha", idx_pegar = 1, idx_esconder = 5 },
+        [2] = { nome = "Cocaina", idx_pegar = 2, idx_esconder = 6 },
+        [3] = { nome = "Crack",   idx_pegar = 3, idx_esconder = 7 },
+        [4] = { nome = "LSD",     idx_pegar = 4, idx_esconder = 8 },
+    }
+    local DROGAS_LABELS = {"Maconha", "Cocaina", "Crack", "LSD"}
+
+    -- ==================== ESTADO ====================
+    local ativo      = false
+    local ciclos     = 0
+    local drogaAtual = nil
+    local fase       = nil
+    local emCooldown = false
+    local gen        = 0
+    local estado     = nil
+    local marcaTerritorio = 0
+
+    local drogaSel = imgui.ImInt(0)
+
+    -- ==================== HELPERS ====================
+    local function rec_log(msg)   print('[RecolherDrogas] ' .. msg) end
+    local function rec_chat(msg)  U.log('RecolherDrogas', msg, 0xFFAA00) end
+
+    local function pressF()
+        if setVirtualKeyDown then
+            setVirtualKeyDown(U.VK_F, true); wait(80); setVirtualKeyDown(U.VK_F, false)
+        else
+            U.user32.keybd_event(U.VK_F, 0, 0, 0); wait(80)
+            U.user32.keybd_event(U.VK_F, 0, U.KEYEVENTF_KEYUP, 0)
+        end
+    end
+
+    local function titulo(prefixo, nomeDroga) return prefixo .. " " .. nomeDroga end
+
+    local function estoqueZerado(textoDialog)
+        if not textoDialog then return false end
+        local qtd = textoDialog:match("possui%s+(%d+)%s*g")
+        return qtd and tonumber(qtd) < 100
+    end
+
+    local function stop(msg)
+        gen = gen + 1; ativo = false; fase = nil; drogaAtual = nil
+        estado = nil; emCooldown = false
+        if msg then rec_log(msg) end
+    end
+
+    local function abrirTerritorio(meuGen, proximoEstado)
+        lua_thread.create(function()
+            if gen ~= meuGen or not ativo then return end
+            local antes = marcaTerritorio
+            pressF(); estado = proximoEstado
+            wait(CFG.waitAposF)
+            if gen == meuGen and ativo and marcaTerritorio == antes then
+                rec_log("Territorio nao abriu, tentando novamente...")
+                abrirTerritorio(meuGen, proximoEstado)
+            end
+        end)
+    end
+
+    -- ==================== DIALOG HANDLER ====================
+    local function onShowDialog(dialogId, style, tituloLimpo, textoDialog)
+        local droga  = DROGAS[drogaAtual]
+        local meuGen = gen
+
+        -- Cooldown do servidor
+        if textoDialog:find("aguarde", 1, true) and textoDialog:find("segundos", 1, true) then
+            lua_thread.create(function()
+                wait(300)
+                if gen ~= meuGen then return end
+                sampSendDialogResponse(dialogId, 1, 0, "")
+                rec_log("Cooldown detectado, aguardando " .. (CFG.cooldownWait/1000) .. "s...")
+                emCooldown = true; wait(CFG.cooldownWait)
+                if gen ~= meuGen or not ativo then return end
+                emCooldown = false; estado = ESTADO.AGUARDANDO_F1; pressF(); wait(CFG.waitAposF)
+            end)
+            return true
+        end
+
+        if not droga then return false end
+
+        -- Dialog principal do territorio
+        if tituloLimpo == CFG.tituloTerritorio then
+            marcaTerritorio = getGameTimer()
+            if estado == ESTADO.AGUARDANDO_F1 then
+                lua_thread.create(function()
+                    wait(CFG.waitAposSelectPegar)
+                    if gen ~= meuGen or not ativo then return end
+                    sampSendDialogResponse(dialogId, 1, droga.idx_pegar, "")
+                    estado = ESTADO.AGUARDANDO_PEGAR; fase = "pegar"
+                end)
+                return true
+            elseif estado == ESTADO.AGUARDANDO_F2 then
+                lua_thread.create(function()
+                    wait(CFG.waitAposSelectEsconder)
+                    if gen ~= meuGen or not ativo then return end
+                    sampSendDialogResponse(dialogId, 1, droga.idx_esconder, "")
+                    estado = ESTADO.AGUARDANDO_ESCONDER; fase = "esconder"
+                end)
+                return true
+            end
+            return true
+        end
+
+        -- Dialog input PEGAR
+        if tituloLimpo == titulo("Pegar", droga.nome) and estado == ESTADO.AGUARDANDO_PEGAR then
+            if estoqueZerado(textoDialog) then
+                rec_chat("Estoque insuficiente de " .. droga.nome .. " (menos de 100g)! Parando.")
+                lua_thread.create(function() wait(200); sampSendDialogResponse(dialogId, 0, 0, "") end)
+                stop(nil); return true
+            end
+            lua_thread.create(function()
+                if gen ~= meuGen or not ativo then return end
+                wait(CFG.waitAposDialogPegar)
+                if gen ~= meuGen or not ativo then return end
+                sampSendDialogResponse(dialogId, 1, 0, CFG.quantidade)
+                wait(CFG.waitAposEnter)
+                if gen ~= meuGen or not ativo then return end
+                estado = ESTADO.AGUARDANDO_F2
+                abrirTerritorio(meuGen, ESTADO.AGUARDANDO_F2)
+            end)
+            return true
+        end
+
+        -- Dialog input ESCONDER
+        if tituloLimpo == titulo("Esconder", droga.nome) and estado == ESTADO.AGUARDANDO_ESCONDER then
+            lua_thread.create(function()
+                if gen ~= meuGen or not ativo then return end
+                wait(CFG.waitAposDialogEsconder)
+                if gen ~= meuGen or not ativo then return end
+                sampSendDialogResponse(dialogId, 1, 0, CFG.quantidade)
+                ciclos = ciclos + 1
+                rec_log("Ciclo " .. ciclos .. "/" .. CFG.maxCiclos .. " concluido! [" .. droga.nome .. "]")
+                if ciclos >= CFG.maxCiclos then stop("Meta atingida!"); return end
+                fase = "pegar"; estado = ESTADO.AGUARDANDO_F1
+                wait(CFG.waitAposEnter); abrirTerritorio(meuGen, ESTADO.AGUARDANDO_F1)
+            end)
+            return true
+        end
+
+        return false
+    end
+
+    -- ==================== API PÚBLICA ====================
+    local M = {}
+
+    function M.iniciarDroga(num)
+        if ativo then stop("Parado manualmente."); return end
+        if not DROGAS[num] then return end
+        gen = gen + 1
+        local meuGen = gen
+        drogaAtual = num; fase = "pegar"; ciclos = 0
+        ativo = true; emCooldown = false; estado = ESTADO.AGUARDANDO_F1
+        rec_log("Iniciado [" .. DROGAS[num].nome .. "]! F10 para parar.")
+        lua_thread.create(function()
+            wait(150)
+            if gen ~= meuGen or not ativo then return end
+            local antes = marcaTerritorio
+            pressF(); wait(CFG.waitAposF)
+            if gen == meuGen and ativo and marcaTerritorio == antes then
+                rec_log("Dialog inicial nao chegou, tentando novamente...")
+                abrirTerritorio(meuGen, ESTADO.AGUARDANDO_F1)
+            end
+        end)
+    end
+
+    function M.stop(msg) stop(msg) end
+    function M.isAtivo() return ativo end
+    function M.getGen() return gen end
+    function M.incrGen() gen = gen + 1 end
+
+    function M.onShowDialog(dialogId, style, tituloLimpo, textoDialog)
+        if not ativo then return false end
+        return onShowDialog(dialogId, style, tituloLimpo, textoDialog)
+    end
+
+    function M.drawGui(W)
+        imgui.SetCursorPosX(20)
+        if ativo then
+            local dNome = DROGAS[drogaAtual] and DROGAS[drogaAtual].nome or "?"
+            imgui.Text("Droga: " .. dNome .. " | Fase: " .. (fase or "?"))
+            imgui.SetCursorPosX(20)
+            imgui.Text("Ciclos: " .. ciclos .. " / " .. CFG.maxCiclos)
+        else
+            imgui.Text("Escolha a droga e inicie:")
+        end
+        imgui.Text("------------------------------------------------")
+        imgui.SetCursorPosX(20)
+        imgui.Text("Droga:")
+        imgui.SameLine()
+        imgui.PushItemWidth(W - 120)
+        imgui.Combo("##recdroga", drogaSel, DROGAS_LABELS, #DROGAS_LABELS)
+        imgui.PopItemWidth()
+        imgui.Text("")
+        local bw = W - 40; local bh = 44
+        imgui.SetCursorPosX(20)
+        if ativo then
+            if U.colorBtn("  PARAR DE RECOLHER  ", bw, bh, 0.08,0.55,0.15, 0.10,0.70,0.20) then
+                M.stop("Parado pela GUI.")
+            end
+        else
+            if U.colorBtn("  RECOLHER DROGAS  ", bw, bh, 0.65,0.05,0.05, 0.80,0.10,0.10) then
+                M.iniciarDroga(drogaSel.v + 1)
+            end
+        end
+    end
+
+    return M
+end
+
+return load
