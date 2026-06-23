@@ -1,0 +1,95 @@
+-- ===================================================================
+--  mod_utils.lua  –  ShoxFarm módulo compartilhado
+--  Upado no Pastebin como RAW e carregado pelo loader via loadstring()
+--  ctx recebido: tabela vazia (apenas para consistência)
+-- ===================================================================
+
+local M = {}
+
+local ffi      = require 'ffi'
+local imgui    = require 'imgui'
+
+ffi.cdef[[
+    void keybd_event(uint8_t bVk, uint8_t bScan, uint32_t dwFlags, uintptr_t dwExtraInfo);
+    typedef struct _STARTUPINFOA {
+        uint32_t cb; char* lpReserved; char* lpDesktop; char* lpTitle;
+        uint32_t dwX, dwY, dwXSize, dwYSize;
+        uint32_t dwXCountChars, dwYCountChars; uint32_t dwFillAttribute;
+        uint32_t dwFlags; uint16_t wShowWindow; uint16_t cbReserved2;
+        uint8_t* lpReserved2; void* hStdInput; void* hStdOutput; void* hStdError;
+    } STARTUPINFOA;
+    typedef struct _PROCESS_INFORMATION {
+        void* hProcess; void* hThread; uint32_t dwProcessId; uint32_t dwThreadId;
+    } PROCESS_INFORMATION;
+    int CreateProcessA(const char*, char*, void*, void*, int, uint32_t, void*,
+                       const char*, STARTUPINFOA*, PROCESS_INFORMATION*);
+    void ExitProcess(uint32_t uExitCode);
+]]
+M.user32   = ffi.load("user32")
+M.kernel32 = ffi.load("kernel32")
+
+M.VK_Y            = 0x59
+M.VK_N            = 0x4E
+M.VK_F            = 0x46
+M.VK_RETURN       = 0x0D
+M.VK_ESCAPE       = 0x1B
+M.VK_F10          = 0x79
+M.KEYEVENTF_KEYUP = 0x0002
+
+function M.log(tag, msg, cor)
+    cor = cor or 0x00FFAA
+    sampAddChatMessage('[' .. tag .. '] ' .. msg, cor)
+end
+
+function M.strip(s)
+    return (tostring(s or ''):gsub('{%x%x%x%x%x%x}', ''))
+end
+
+function M.trim(s)
+    return (s or ''):match('^%s*(.-)%s*$')
+end
+
+function M.jitter(base, range)
+    if range <= 0 then return base end
+    return base + math.random(0, range)
+end
+
+function M.pressKey(vk)
+    M.user32.keybd_event(vk, 0, 0, 0)
+    wait(60)
+    M.user32.keybd_event(vk, 0, M.KEYEVENTF_KEYUP, 0)
+end
+
+function M.pressKeyN()
+    if setVirtualKeyDown then
+        setVirtualKeyDown(M.VK_N, true); wait(60); setVirtualKeyDown(M.VK_N, false)
+    else
+        M.pressKey(M.VK_N)
+    end
+end
+
+function M.pressKeyEsc()
+    if setVirtualKeyDown then
+        setVirtualKeyDown(M.VK_ESCAPE, true); wait(60); setVirtualKeyDown(M.VK_ESCAPE, false)
+    else
+        M.pressKey(M.VK_ESCAPE)
+    end
+end
+
+function M.colorBtn(label, w, h, r,g,b, rh,gh,bh)
+    imgui.PushStyleColor(imgui.Col.Button,        imgui.ImVec4(r,  g,  b,  1))
+    imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(rh, gh, bh, 1))
+    imgui.PushStyleColor(imgui.Col.ButtonActive,  imgui.ImVec4(r,  g,  b,  0.8))
+    local clicked = imgui.Button(label, imgui.ImVec2(w, h))
+    imgui.PopStyleColor(3)
+    return clicked
+end
+
+function M.warnText(txt)
+    imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(1.0, 0.85, 0.1, 1))
+    imgui.SetCursorPosX(20)
+    imgui.Text(txt)
+    imgui.PopStyleColor()
+end
+
+return M
