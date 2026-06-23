@@ -1,0 +1,482 @@
+-- ===================================================================
+--  mod_advogado.lua  –  ShoxFarm módulo AutoAdvogado
+--  Recebe ctx (tabela compartilhada com U = mod_utils)
+--  Retorna API pública: { start, stop, onShowDialog, isRodando,
+--                         drawGui, watchdog }
+-- ===================================================================
+
+local function load(ctx)
+    local U      = ctx.U
+    local imgui  = require 'imgui'
+
+    -- ==================== CONSTANTES ====================
+    local ESTADO_OCIOSO      = 'ocioso'
+    local ESTADO_LISTA       = 'lista'
+    local ESTADO_PERCENTUAL  = 'percentual'
+    local ESTADO_VALOR       = 'valor'
+    local ESTADO_CONFIRMACAO = 'confirmacao'
+    local ESTADO_RESULTADO   = 'resultado'
+
+    local ADV_DELAY           = 1200
+    local ADV_TEMPO_ESPERA    = 6000
+    local ADV_TEMPO_RESPOSTA  = 15000
+    local ADV_MAX_ABERTURA    = 5
+    local ADV_MAX_TENTATIVAS  = 6
+    local ADV_MAX_FECHAR      = 5
+    local ADV_VALORES         = {500, 777}
+    local ADV_PERCENT_INDEX   = {[5]=0,[10]=1,[15]=2,[20]=3,[25]=4,[30]=5,[35]=6,[40]=7,[45]=8,[50]=9}
+    local ADV_WATCHDOG_IDLE   = 20000
+
+    local TITULO_LISTA    = 'Total de Presos'
+    local TITULO_PERC     = 'Reduzir Pena'
+    local TITULO_VALOR    = 'Insira abaixo'
+    local TITULO_CONF     = 'Voce ofereceu'
+    local TITULO_CANCEL   = 'Proposta Cancelada'
+    local TITULO_DINHEIRO = 'Dinheiro Insuficiente'
+    local TITULO_CONVERSA = 'conversa com o detento'
+
+    local ADV_LISTA_VAZIA_TENTATIVAS = 3
+    local ADV_LISTA_VAZIA_DELAY      = 4000
+    local ADV_LISTA_VAZIA_ECONOMIA   = 5000
+
+    local percentuais = {5,10,15,20,25,30,35,40,45,50}
+
+    local HAS_DIALOG_GUARD = (type(sampIsDialogActive)=='function') and (type(sampGetCurrentDialogId)=='function')
+
+    -- ==================== ESTADO ====================
+    local rodando            = false
+    local percentualAtual    = nil
+    local presosTentados     = {}
+    local tentativasAbertura = 0
+    local dialogGen          = 0
+    local dialogAtualId      = nil
+    local dialogAtualTitulo  = ''
+    local dialogAtualTexto   = ''
+    local nomeAtual          = nil
+    local valorAtual         = nil
+    local estado             = ESTADO_OCIOSO
+    local abrindoMenu        = false
+    local ggPendente         = false
+    local ultimoEvento       = 0
+    local watchdogAtivo      = false
+    local semPresosAtivo     = false
+    local listaVaziaContagem = 0
+    local debugMode          = true
+
+    -- GUI
+    local percentualIdx = imgui.ImFloat(0)
+
+    -- ==================== HELPERS ====================
+    local function adv_log(msg)  U.log('AutoAdvogado', msg, 0x00CFFF) end
+    local function adv_dbg(msg)
+        if debugMode then U.log('ADV.DBG', msg, 0x888888) end
+    end
+
+    local function marcarEvento() ultimoEvento = getGameTimer() end
+
+    local function dialogAindaAtivo(dialogId, meuGen)
+        if dialogGen ~= meuGen then return false end
+        if not HAS_DIALOG_GUARD then return true end
+        local ok, ativo = pcall(sampIsDialogActive)
+        if not ok or not ativo then return false end
+        local ok2, idAtual = pcall(sampGetCurrentDialogId)
+        if not ok2 then return true end
+        return idAtual == dialogId
+    end
+
+    local function simularF()
+        U.user32.keybd_event(U.VK_F, 0, 0, 0); wait(80)
+        U.user32.keybd_event(U.VK_F, 0, U.KEYEVENTF_KEYUP, 0); wait(50)
+    end
+    local function simularEnter()
+        U.user32.keybd_event(U.VK_RETURN, 0, 0, 0); wait(80)
+        U.user32.keybd_event(U.VK_RETURN, 0, U.KEYEVENTF_KEYUP, 0); wait(50)
+    end
+    local function simularEsc()
+        U.user32.keybd_event(U.VK_ESCAPE, 0, 0, 0); wait(80)
+        U.user32.keybd_event(U.VK_ESCAPE, 0, U.KEYEVENTF_KEYUP, 0); wait(50)
+    end
+
+    local function tituloContem(trecho)
+        return dialogAtualTitulo:find(trecho, 1, true) or dialogAtualTexto:find(trecho, 1, true)
+    end
+
+    local function aguardarTituloEAgir(dialogId, meuGen, trecho, label, acao)
+        wait(ADV_DELAY)
+        for i = 1, ADV_MAX_TENTATIVAS do
+            if not rodando then return false end
+            if not dialogAindaAtivo(dialogId, meuGen) then
+                adv_dbg(label .. ' sumiu na tent.' .. i); return false
+            end
+            if tituloContem(trecho) then
+                adv_dbg(label .. ' confirmado tent.' .. i); wait(ADV_DELAY); acao(); return true
+            end
+            adv_dbg(label .. ' aguardando tent.' .. i .. '/' .. ADV_MAX_TENTATIVAS)
+            wait(ADV_DELAY)
+        end
+        adv_dbg(label .. ' nao confirmado. Abortando.'); return false
+    end
+
+    local function fecharComCerteza(dialogId, meuGen, tituloOrig, label, maxTent)
+        wait(ADV_DELAY)
+        for i = 1, maxTent do
+            if not rodando then return end
+            if not dialogAindaAtivo(dialogId, meuGen) then adv_dbg(label .. ' ja sumiu.'); return end
+            if tituloContem(tituloOrig) then
+                adv_dbg(label .. ' ainda aberto tent.' .. i .. '. Enter...')
+                simularEnter(); wait(ADV_DELAY)
+            else
+                adv_dbg(label .. ' fechou.'); return
+            end
+        end
+        if dialogAindaAtivo(dialogId, meuGen) then
+            sampSendDialogResponse(dialogId, 1, 0, '')
+        end
+    end
+
+    local function fecharDialogPendente()
+        if not HAS_DIALOG_GUARD then return end
+        local ok, ativo = pcall(sampIsDialogActive)
+        if not ok or not ativo then return end
+        wait(ADV_DELAY)
+        local ok2, ativo2 = pcall(sampIsDialogActive)
+        if not ok2 or not ativo2 then return end
+        local tituloInicio = dialogAtualTitulo
+        wait(ADV_DELAY)
+        if dialogAtualTitulo ~= tituloInicio then return end
+        adv_dbg('fecharPendente: titulo estavel, fechando ESC.')
+        simularEsc(); wait(ADV_DELAY)
+    end
+
+    -- forward declarations
+    local tentarAbrirMenu
+    local proximoPreso
+    local marcarTentadoEContinuar
+
+    local function tentarAbrirMenuFn()
+        if abrindoMenu then adv_dbg('tentarAbrirMenu ja rodando, ignorando.'); return end
+        abrindoMenu = true
+        marcarEvento()
+        estado = ESTADO_LISTA
+        nomeAtual = nil; valorAtual = nil; tentativasAbertura = 0
+        adv_dbg('Abrindo menu (F)...')
+        fecharDialogPendente()
+        for i = 1, ADV_MAX_ABERTURA do
+            if not rodando then abrindoMenu = false; return end
+            local genAntes = dialogGen
+            simularF()
+            local deadline = getGameTimer() + ADV_TEMPO_ESPERA
+            while getGameTimer() < deadline do
+                if dialogGen ~= genAntes then break end
+                if not rodando then abrindoMenu = false; return end
+                wait(250)
+            end
+            if dialogGen ~= genAntes then
+                adv_dbg('Menu abriu.'); marcarEvento(); abrindoMenu = false; return
+            end
+            adv_dbg('Menu nao abriu tent.' .. i); wait(ADV_DELAY)
+        end
+        adv_log('Nao foi possivel abrir menu apos ' .. ADV_MAX_ABERTURA .. ' tentativas. Parando.')
+        rodando = false; semPresosAtivo = false; abrindoMenu = false; estado = ESTADO_OCIOSO
+    end
+    tentarAbrirMenu = tentarAbrirMenuFn
+
+    local function semPresosDisponiveis()
+        if semPresosAtivo then adv_dbg('Loop sem presos ja ativo.'); return end
+        semPresosAtivo = true
+        local ok, ativo = pcall(sampIsDialogActive)
+        if ok and ativo then simularEsc() end
+        listaVaziaContagem = listaVaziaContagem + 1
+        local delay
+        if listaVaziaContagem <= ADV_LISTA_VAZIA_TENTATIVAS then
+            delay = ADV_LISTA_VAZIA_DELAY
+            adv_log('Sem presos (tent.' .. listaVaziaContagem .. '/' .. ADV_LISTA_VAZIA_TENTATIVAS .. '). Aguardando ' .. (delay/1000) .. 's...')
+        else
+            delay = ADV_LISTA_VAZIA_ECONOMIA
+            if listaVaziaContagem == ADV_LISTA_VAZIA_TENTATIVAS + 1 then
+                adv_log('Lista esgotada. Modo economia: revisando recusados a cada ' .. (delay/1000) .. 's...')
+                presosTentados = {}
+            else
+                adv_log('Modo economia: aguardando ' .. (delay/1000) .. 's...')
+            end
+        end
+        wait(delay)
+        semPresosAtivo = false
+        if not rodando then return end
+        tentarAbrirMenuFn()
+    end
+
+    marcarTentadoEContinuar = function(motivo)
+        adv_log(motivo); marcarEvento()
+        if nomeAtual then presosTentados[nomeAtual] = true end
+        nomeAtual = nil; valorAtual = nil
+        lua_thread.create(function() wait(ADV_DELAY); tentarAbrirMenuFn() end)
+    end
+
+    local function extrairNome(linha)
+        local nome = linha:match('^(.-)%s*\t') or linha:match('^(.-)%s*%|') or
+                     linha:match('^(.-)%s%s+%u') or linha:match('^(.-)%s*%(ID:') or linha
+        return U.trim(U.strip(nome or linha))
+    end
+
+    -- ==================== HANDLERS DE DIALOG ====================
+    local function processarLista(dialogId, texto)
+        adv_dbg('Lista recebida.')
+        local linhas = {}
+        for linha in (texto .. '\n'):gmatch('(.-)%\n') do
+            if U.trim(U.strip(linha)) ~= '' then table.insert(linhas, linha) end
+        end
+        local inicioIdx = 1
+        if linhas[1] and (linhas[1]:find('Detento',1,true) or linhas[1]:find('Tempo',1,true)) then
+            inicioIdx = 2; adv_dbg('Cabecalho detectado.')
+        end
+        local idxEscolhido, nomeEscolhido = nil, nil
+        for idx = inicioIdx, #linhas do
+            local linhaLimpa = U.strip(linhas[idx])
+            if linhaLimpa:find('Nao Ajustado', 1, true) then
+                local nome     = extrairNome(linhaLimpa)
+                local idxDialog = idx - inicioIdx
+                if nome ~= '' and not presosTentados[nome] then
+                    idxEscolhido = idxDialog; nomeEscolhido = nome; break
+                end
+            end
+        end
+        if not idxEscolhido then
+            adv_dbg('Nenhum "Nao Ajustado" disponivel.')
+            lua_thread.create(semPresosDisponiveis); return
+        end
+        nomeAtual = nomeEscolhido; estado = ESTADO_PERCENTUAL; listaVaziaContagem = 0
+        lua_thread.create(function()
+            wait(ADV_DELAY); if not rodando then return end
+            sampSetCurrentDialogListItem(idxEscolhido); wait(150)
+            sampSendDialogResponse(dialogId, 1, idxEscolhido, '')
+        end)
+    end
+
+    local function processarPercentual(dialogId)
+        adv_dbg('Dialog percentual.'); estado = ESTADO_VALOR
+        local percIdx = ADV_PERCENT_INDEX[percentualAtual]
+        lua_thread.create(function()
+            wait(ADV_DELAY); if not rodando then return end
+            sampSetCurrentDialogListItem(percIdx); wait(100)
+            sampSendDialogResponse(dialogId, 1, percIdx, '')
+        end)
+    end
+
+    local function processarValor(dialogId)
+        adv_dbg('Dialog valor.'); estado = ESTADO_CONFIRMACAO
+        valorAtual = ADV_VALORES[math.random(1, #ADV_VALORES)]
+        local valorStr = tostring(valorAtual)
+        lua_thread.create(function()
+            wait(ADV_DELAY); if not rodando then return end
+            wait(ADV_DELAY); sampSendDialogResponse(dialogId, 1, 0, valorStr)
+        end)
+    end
+
+    local function processarConfirmacao(dialogId)
+        adv_dbg('Dialog confirmacao.'); estado = ESTADO_RESULTADO
+        local genAntes = dialogGen
+        lua_thread.create(function()
+            wait(ADV_DELAY); if not rodando then return end
+            sampSendDialogResponse(dialogId, 1, 0, ''); ggPendente = true; marcarEvento()
+            adv_dbg('Aguardando resposta do preso (' .. (ADV_TEMPO_RESPOSTA/1000) .. 's)...')
+            local deadline = getGameTimer() + ADV_TEMPO_RESPOSTA
+            while getGameTimer() < deadline do
+                if not rodando then return end
+                if dialogGen ~= genAntes then adv_dbg('Resultado chegou.'); return end
+                wait(400)
+            end
+            estado = ESTADO_OCIOSO; ggPendente = false
+            adv_log('Preso nao respondeu. Pulando...')
+            local ok2, ativoD = pcall(sampIsDialogActive)
+            if ok2 and ativoD then simularEsc(); wait(ADV_DELAY) end
+            if nomeAtual then presosTentados[nomeAtual] = true end
+            nomeAtual = nil; valorAtual = nil; marcarEvento()
+            if rodando then wait(ADV_DELAY); tentarAbrirMenuFn() end
+        end)
+    end
+
+    local function processarResultado(dialogId, textoDialog, conteudo)
+        local nomeSnapshot  = nomeAtual
+        local valorSnapshot = valorAtual
+        adv_dbg('Dialog resultado.'); estado = ESTADO_OCIOSO; marcarEvento()
+        local meuGen = dialogGen
+        lua_thread.create(function()
+            wait(ADV_DELAY); if not rodando then return end
+            if conteudo:find('conversa com o detento', 1, true) then
+                adv_log('ACEITOU! [' .. tostring(nomeSnapshot) .. ' / R$' .. tostring(valorSnapshot) .. ']')
+                lua_thread.create(function() wait(300); sampSendChat('GG mano!') end)
+            elseif conteudo:find(TITULO_CANCEL, 1, true) then
+                adv_log('Proposta recusada para ' .. tostring(nomeSnapshot) .. '.'); ggPendente = false
+            else
+                adv_log('Resultado desconhecido para ' .. tostring(nomeSnapshot) .. '.'); ggPendente = false
+            end
+            if nomeSnapshot then presosTentados[nomeSnapshot] = true end
+            nomeAtual = nil; valorAtual = nil
+            fecharComCerteza(dialogId, meuGen, dialogAtualTitulo, 'resultado', ADV_MAX_FECHAR)
+            wait(ADV_DELAY); marcarEvento(); tentarAbrirMenuFn()
+        end)
+    end
+
+    local function processarDinheiroInsuficiente(dialogId)
+        estado = ESTADO_OCIOSO
+        local meuGen = dialogGen; local tituloAtual = dialogAtualTitulo
+        lua_thread.create(function()
+            fecharComCerteza(dialogId, meuGen, tituloAtual, 'dinheiro insuficiente', ADV_MAX_FECHAR)
+            marcarTentadoEContinuar(tostring(nomeAtual) .. ' sem saldo. Pulando.')
+        end)
+    end
+
+    local function processarPropostaCanceladaPrecoce(dialogId)
+        estado = ESTADO_OCIOSO
+        local meuGen = dialogGen; local tituloAtual = dialogAtualTitulo
+        lua_thread.create(function()
+            fecharComCerteza(dialogId, meuGen, tituloAtual, 'proposta cancelada', ADV_MAX_FECHAR)
+            marcarTentadoEContinuar(tostring(nomeAtual) .. ' ja ajustado. Pulando.')
+        end)
+    end
+
+    local function processarDialogConversa(dialogId)
+        adv_dbg('Dialog conversa concluida em estado OCIOSO, fechando...')
+        local meuGen = dialogGen; local tituloAtual = dialogAtualTitulo
+        lua_thread.create(function()
+            wait(ADV_DELAY)
+            fecharComCerteza(dialogId, meuGen, tituloAtual, 'conversa concluida', ADV_MAX_FECHAR)
+            marcarEvento()
+            if rodando then wait(ADV_DELAY); tentarAbrirMenuFn() end
+        end)
+    end
+
+    -- ==================== API PÚBLICA ====================
+    local M = {}
+
+    function M.start(percentual)
+        if rodando then adv_log('Ja rodando. F10 para parar.'); return end
+        rodando = true; percentualAtual = percentual
+        presosTentados = {}; tentativasAbertura = 0; semPresosAtivo = false
+        listaVaziaContagem = 0; abrindoMenu = false; ggPendente = false
+        marcarEvento()
+        adv_log('Iniciado com ' .. percentual .. '% de reducao.')
+        lua_thread.create(M.watchdog)
+        lua_thread.create(function() wait(100); tentarAbrirMenuFn() end)
+    end
+
+    function M.stop(motivo)
+        if rodando then
+            rodando = false; estado = ESTADO_OCIOSO; ggPendente = false
+            adv_log(motivo or 'Rotina interrompida.')
+        end
+        semPresosAtivo = false
+    end
+
+    function M.isRodando() return rodando end
+    function M.isGgPendente() return ggPendente end
+    function M.setGgPendente(v) ggPendente = v end
+    function M.getPlayerNick() return ctx.playerNick end
+    function M.getDialogTitulo() return dialogAtualTitulo end
+    function M.getDialogTexto() return dialogAtualTexto end
+
+    function M.watchdog()
+        if watchdogAtivo then return end
+        watchdogAtivo = true
+        while rodando do
+            wait(5000)
+            if not rodando then break end
+            if getGameTimer() - ultimoEvento > ADV_WATCHDOG_IDLE and not abrindoMenu then
+                adv_log('Watchdog: inatividade. Reiniciando ciclo...')
+                marcarEvento(); estado = ESTADO_OCIOSO; tentarAbrirMenuFn()
+            end
+        end
+        watchdogAtivo = false
+    end
+
+    -- Handler principal de onShowDialog para o módulo advogado
+    -- Retorna true se tratou o dialog (deve suprimir), false caso contrário
+    function M.onShowDialog(dialogId, style, tituloLimpo, textoDialog, conteudo)
+        -- atualiza estado de dialog sempre, mesmo sem estar rodando
+        dialogGen = dialogGen + 1
+        marcarEvento()
+        dialogAtualId     = dialogId
+        dialogAtualTitulo = tituloLimpo
+        dialogAtualTexto  = textoDialog
+
+        if not rodando then return false end
+
+        if conteudo:find(TITULO_DINHEIRO, 1, true) then
+            processarDinheiroInsuficiente(dialogId); return false
+        end
+        if estado ~= ESTADO_RESULTADO and conteudo:find(TITULO_CANCEL, 1, true) then
+            processarPropostaCanceladaPrecoce(dialogId); return false
+        end
+        if estado == ESTADO_LISTA and conteudo:find(TITULO_LISTA, 1, true) then
+            processarLista(dialogId, textoDialog); return false
+        end
+        if estado == ESTADO_PERCENTUAL and conteudo:find(TITULO_PERC, 1, true) then
+            processarPercentual(dialogId); return false
+        end
+        if estado == ESTADO_VALOR and conteudo:find(TITULO_VALOR, 1, true) then
+            processarValor(dialogId); return false
+        end
+        if estado == ESTADO_CONFIRMACAO and conteudo:find(TITULO_CONF, 1, true) then
+            processarConfirmacao(dialogId); return false
+        end
+        if estado == ESTADO_RESULTADO then
+            processarResultado(dialogId, textoDialog, conteudo); return false
+        end
+        -- BUG1 FIX
+        if estado == ESTADO_OCIOSO and conteudo:find(TITULO_CONVERSA, 1, true) then
+            processarDialogConversa(dialogId); return false
+        end
+        return false
+    end
+
+    -- GUI da aba Advogado (chamada dentro do imgui.OnDrawFrame do loader)
+    function M.drawGui(W)
+        imgui.SetCursorPosX(20)
+        imgui.Text("Porcentagem de Reducao:")
+        imgui.Text("")
+        imgui.SetCursorPosX(20)
+        imgui.SliderFloat("##advperc", percentualIdx, 0, 9, "%.0f")
+        local percLabel = percentuais[math.floor(percentualIdx.v) + 1] .. "%"
+        imgui.SetCursorPosX(20)
+        imgui.Text("Reducao selecionada: " .. percLabel)
+        imgui.Text("------------------------------------------------")
+
+        local bw = W - 40
+        local bh = 44
+        imgui.SetCursorPosX(20)
+        if rodando then
+            if U.colorBtn("  PARAR  ", bw, bh, 0.08,0.55,0.15, 0.10,0.70,0.20) then
+                M.stop("Parado pela GUI.")
+            end
+        else
+            if U.colorBtn("  INICIAR  ", bw, bh, 0.65,0.05,0.05, 0.80,0.10,0.10) then
+                M.start(percentuais[math.floor(percentualIdx.v) + 1])
+            end
+        end
+    end
+
+    -- Handler de onServerMessage (detecção de "GG mano!")
+    function M.onServerMessage(color, text)
+        local limpo = U.strip(text)
+        if rodando and ggPendente then
+            local nomeAdv = limpo:match('[Ii]niciou uma conversa privada com o advogado%s+(.-)%s*$') or
+                            limpo:match('[Ii]niciou uma conversa privada com o advogado%s+(.-)[%.!%s]')
+            if nomeAdv and nomeAdv ~= '' then
+                local meuNick = ctx.playerNick or ''
+                local match = (meuNick == '' or meuNick == '...')
+                if not match then
+                    match = nomeAdv:lower():find(meuNick:lower(), 1, true) ~= nil
+                end
+                if match then
+                    adv_log('Preso aceitou conversa!')
+                    ggPendente = false
+                end
+            end
+        end
+    end
+
+    return M
+end
+
+return load
