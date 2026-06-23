@@ -1,0 +1,120 @@
+-- ===================================================================
+--  mod_produzir.lua  –  ShoxFarm módulo AutoProduzir
+--  Recebe ctx (tabela compartilhada com U = mod_utils)
+--  Retorna API pública: { start, stop, isAtivo, onShowDialog, drawGui }
+-- ===================================================================
+
+local function load(ctx)
+    local U     = ctx.U
+    local imgui = require 'imgui'
+
+    -- ==================== CONFIG ====================
+    local PROD_MAX           = 40
+    local PROD_HOLD_INTERVAL = 50
+    local PROD_AFTER_CLOSE   = 1500
+
+    -- ==================== ESTADO ====================
+    local ativo           = false
+    local producoes       = 0
+    local dialogRecebido  = false
+    local pendingDialogId = nil
+
+    -- ==================== HELPERS ====================
+    local function prod_log(msg)
+        local linha = '[AutoProduzir] ' .. msg
+        if sampfuncsLog then sampfuncsLog(linha) end
+        print(linha)
+    end
+
+    local function loopProduzir()
+        producoes       = 0
+        dialogRecebido  = false
+        pendingDialogId = nil
+        prod_log('Producao iniciada.')
+
+        while ativo and producoes < PROD_MAX do
+            dialogRecebido  = false
+            pendingDialogId = nil
+
+            U.user32.keybd_event(U.VK_Y, 0, 0, 0)
+            while ativo and not dialogRecebido do
+                wait(PROD_HOLD_INTERVAL)
+                U.user32.keybd_event(U.VK_Y, 0, 0, 0)
+            end
+            U.user32.keybd_event(U.VK_Y, 0, U.KEYEVENTF_KEYUP, 0)
+
+            if not ativo then break end
+
+            wait(PROD_AFTER_CLOSE)
+            if pendingDialogId then
+                sampSendDialogResponse(pendingDialogId, 1, 0, '')
+            end
+
+            producoes = producoes + 1
+            prod_log('Loop ' .. producoes .. '/' .. PROD_MAX .. ' (' .. (producoes * 100) .. '/4000)')
+        end
+
+        if producoes >= PROD_MAX then
+            prod_log('Limite de ' .. PROD_MAX .. ' loops atingido. Parando.')
+        else
+            prod_log('Producao interrompida.')
+        end
+        ativo = false
+    end
+
+    -- ==================== API PÚBLICA ====================
+    local M = {}
+
+    function M.start()
+        if ativo then return end
+        ativo = true
+        lua_thread.create(loopProduzir)
+    end
+
+    function M.stop(motivo)
+        ativo = false
+        U.user32.keybd_event(U.VK_Y, 0, U.KEYEVENTF_KEYUP, 0)
+        if motivo then print('[AutoProduzir] ' .. motivo) end
+    end
+
+    function M.isAtivo() return ativo end
+
+    -- Retorna true se suprimiu o dialog
+    function M.onShowDialog(dialogId, style, tituloLimpo, textoDialog)
+        if not ativo then return false end
+        if tituloLimpo:find('Producao Concluida', 1, true) or
+           (tituloLimpo:find('Produ', 1, true) and tituloLimpo:find('Conclu', 1, true)) then
+            pendingDialogId = dialogId
+            dialogRecebido  = true
+            return true  -- suprimir dialog
+        end
+        return false
+    end
+
+    function M.drawGui(W)
+        imgui.SetCursorPosX(20)
+        if ativo then
+            imgui.Text("Producoes: " .. producoes .. " / " .. PROD_MAX)
+        else
+            imgui.Text("Aguardando inicio...")
+        end
+        imgui.Text("------------------------------------------------")
+
+        local bw = W - 40
+        local bh = 44
+        imgui.SetCursorPosX(20)
+        if ativo then
+            if U.colorBtn("  PARAR DE PRODUZIR  ", bw, bh, 0.08,0.55,0.15, 0.10,0.70,0.20) then
+                M.stop("Parado pela GUI.")
+            end
+        else
+            if U.colorBtn("  PRODUZIR  ", bw, bh, 0.65,0.05,0.05, 0.80,0.10,0.10) then
+                M.start()
+            end
+        end
+    end
+
+    return M
+end
+
+return load
