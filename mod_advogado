@@ -468,7 +468,9 @@ local function load(ctx)
         imgui.Dummy(imgui.ImVec2(0, 2))
 
         imgui.SetCursorPosX(20)
+        imgui.PushItemWidth(bw)
         imgui.SliderFloat("##advperc", percentualIdx, 0, stepsCount - 1, "")
+        imgui.PopItemWidth()
         local percLabel = percentuais[math.floor(percentualIdx.v) + 1] .. "%"
         imgui.SetCursorPosX(20)
         imgui.Text("Reducao selecionada: " .. percLabel)
