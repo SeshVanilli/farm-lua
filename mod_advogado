@@ -434,15 +434,46 @@ local function load(ctx)
     function M.drawGui(W)
         imgui.SetCursorPosX(20)
         imgui.Text("Porcentagem de Reducao:")
-        imgui.Text("")
+
+        local bw = W - 40
+        local stepsCount = #percentuais -- 10 valores (5..50)
+
+        -- ===== Régua métrica acima do slider =====
+        -- Cada marca representa um valor de percentuais[], alinhada com a
+        -- posição correspondente do SliderFloat (que vai de 0 a stepsCount-1).
         imgui.SetCursorPosX(20)
-        imgui.SliderFloat("##advperc", percentualIdx, 0, 9, "%.0f")
+        local rulerStartX = imgui.GetCursorScreenPos().x
+        local rulerY       = imgui.GetCursorScreenPos().y
+        local drawList      = imgui.GetWindowDrawList()
+        local rulerHeight   = 14
+
+        for i = 1, stepsCount do
+            local frac = (i - 1) / (stepsCount - 1)
+            local x = rulerStartX + frac * bw
+
+            -- traço vertical da marca
+            drawList:AddLine(
+                imgui.ImVec2(x, rulerY + rulerHeight - 6),
+                imgui.ImVec2(x, rulerY + rulerHeight),
+                imgui.GetColorU32(imgui.ImVec4(0.75, 0.10, 0.10, 1.0)), 1.5)
+
+            -- texto da porcentagem centralizado sobre o traço
+            local label    = tostring(percentuais[i])
+            local textSize = imgui.CalcTextSize(label)
+            imgui.SetCursorScreenPos(imgui.ImVec2(x - textSize.x * 0.5, rulerY))
+            imgui.Text(label)
+        end
+
+        imgui.SetCursorScreenPos(imgui.ImVec2(rulerStartX, rulerY + rulerHeight))
+        imgui.Dummy(imgui.ImVec2(0, 2))
+
+        imgui.SetCursorPosX(20)
+        imgui.SliderFloat("##advperc", percentualIdx, 0, stepsCount - 1, "")
         local percLabel = percentuais[math.floor(percentualIdx.v) + 1] .. "%"
         imgui.SetCursorPosX(20)
         imgui.Text("Reducao selecionada: " .. percLabel)
         imgui.Text("------------------------------------------------")
 
-        local bw = W - 40
         local bh = 44
         imgui.SetCursorPosX(20)
         if rodando then
