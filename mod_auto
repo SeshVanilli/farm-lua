@@ -1,13 +1,10 @@
 --[[
     mod_auto.lua  –  Auto's
     Módulo do ShoxFarm:
-      • Auto Caixinha  → /caixinha a cada 30 min + gatilho "Juros Bancario"
-      • Auto Drogas    → /usarlsd | /usarcrack | /usarcocaina | /usarmaconha
-                         Monitora colete do player: só para quando atingir 200.
-                         Antes de cada comando, ativa proteções de RPC temporárias
-                         (nobebado, noespecialactionsv, nofreezecharsv,
-                          nocleananimsv, noanim, bloacksincweapon)
-                         e as desativa logo após o envio.
+      • Auto Caixinha → /caixinha a cada 30 min + gatilho "Juros Bancario"
+      • Auto Drogas   → /usarlsd | /usarcrack | /usarcocaina | /usarmaconha
+                        Monitora colete: só para quando atingir 200.
+                        Bloqueia animações do servidor durante cada /usar...
 ]]
 
 local sampev = require 'lib.samp.events'
@@ -17,98 +14,25 @@ return function(ctx)
     local U = ctx.U
 
     -- ===================================================================
-    --  PROTEÇÕES RPC  (flags booleanas simples, SEM ImBool — só internas)
-    --  Cada flag = true significa "bloquear este RPC agora"
+    --  PROTEÇÃO RPC  (apenas bloquear animações durante o /usar...)
     -- ===================================================================
-    local rpc = {
-        nobebado           = false,
-        noespecialactionsv = false,
-        nofreezecharsv     = false,
-        nocleananimsv      = false,
-        noanim             = false,
-        bloacksincweapon   = false,
-    }
+    local block_anims = false   -- true somente nos instantes do comando
 
-    -- Ativa todas as proteções de uso de droga
-    local function rpcLigar()
-        rpc.nobebado           = true
-        rpc.noespecialactionsv = true
-        rpc.nofreezecharsv     = true
-        rpc.nocleananimsv      = true
-        rpc.noanim             = true
-        rpc.bloacksincweapon   = true
+    function sampev.onApplyPlayerAnimation(playerId, ...)
+        if block_anims and playerId == select(2, sampGetPlayerIdByCharHandle(playerPed)) then
+            return false
+        end
     end
 
-    -- Desativa todas as proteções de uso de droga
-    local function rpcDesligar()
-        rpc.nobebado           = false
-        rpc.noespecialactionsv = false
-        rpc.nofreezecharsv     = false
-        rpc.nocleananimsv      = false
-        rpc.noanim             = false
-        rpc.bloacksincweapon   = false
-    end
-
-    -- Helper: pega o myId uma vez
-    local function getMyId()
-        local ok, id = sampGetPlayerIdByCharHandle(playerPed)
-        if ok then return id end
-        return -1
-    end
-
-    -- ===================================================================
-    --  INTERCEPTADORES RPC  (registrados via sampev, sempre ativos,
-    --  mas só bloqueiam quando as flags estiverem true)
-    -- ===================================================================
-
-    -- Bloquear efeito de embriaguez
-    local _origDrunk = sampev.onSetPlayerDrunk
-    sampev.onSetPlayerDrunk = function(level)
-        if rpc.nobebado then return false end
-        if _origDrunk then return _origDrunk(level) end
-    end
-
-    -- Bloquear ações especiais
-    local _origSpecial = sampev.onSetPlayerSpecialAction
-    sampev.onSetPlayerSpecialAction = function(action)
-        if rpc.noespecialactionsv then return false end
-        if _origSpecial then return _origSpecial(action) end
-    end
-
-    -- Bloquear congelamento
-    local _origFreeze = sampev.onTogglePlayerControllable
-    sampev.onTogglePlayerControllable = function(controlled)
-        if rpc.nofreezecharsv then return false end
-        if _origFreeze then return _origFreeze(controlled) end
-    end
-
-    -- Bloquear limpeza de animação
-    local _origClearAnim = sampev.onClearPlayerAnimation
-    sampev.onClearPlayerAnimation = function(playerId)
-        if rpc.nocleananimsv and playerId == getMyId() then return false end
-        if _origClearAnim then return _origClearAnim(playerId) end
-    end
-
-    -- Bloquear animações do servidor
-    local _origAnim = sampev.onApplyPlayerAnimation
-    sampev.onApplyPlayerAnimation = function(playerId, animLib, animName, ...)
-        if rpc.noanim and playerId == getMyId() then return false end
-        if _origAnim then return _origAnim(playerId, animLib, animName, ...) end
-    end
-
-    -- Bypass sincronização de armas (pacote 204)
-    local _origPkt = sampev.onSendPacket
-    sampev.onSendPacket = function(packetId, ...)
-        if rpc.bloacksincweapon and packetId == 204 then return false end
-        if _origPkt then return _origPkt(packetId, ...) end
-    end
+    local function rpcLigar()   block_anims = true  end
+    local function rpcDesligar() block_anims = false end
 
     -- ===================================================================
     --  AUTO CAIXINHA
     -- ===================================================================
-    local cxAtivo        = false
-    local CAIXINHA_MS    = 30 * 60 * 1000
-    local chkCaixinha    = imgui.ImBool(false)
+    local cxAtivo     = false
+    local CAIXINHA_MS = 30 * 60 * 1000
+    local chkCaixinha = imgui.ImBool(false)
 
     local function enviarCaixinha()
         if isSampAvailable() then
@@ -141,48 +65,37 @@ return function(ctx)
     -- ===================================================================
     --  AUTO DROGAS
     -- ===================================================================
-    -- drogas disponíveis
     local DROGAS = {
-        { label = "|   |AutoLsd",      cmd = "/usarlsd"      },
-        { label = "|   |AutoCrack",    cmd = "/usarcrack"    },
-        { label = "|   |AutoCocaina",  cmd = "/usarcocaina"  },
-        { label = "|   |AutoMaconha",  cmd = "/usarmaconha"  },
+        { label = "|   |AutoLsd",     cmd = "/usarlsd"     },
+        { label = "|   |AutoCrack",   cmd = "/usarcrack"   },
+        { label = "|   |AutoCocaina", cmd = "/usarcocaina" },
+        { label = "|   |AutoMaconha", cmd = "/usarmaconha" },
     }
 
-    -- checkboxes ImBool para cada droga
-    local chkDrogas = {}
+    local chkDrogas  = {}
+    local drogaAtiva = {}
     for i = 1, #DROGAS do
-        chkDrogas[i] = imgui.ImBool(false)
+        chkDrogas[i]  = imgui.ImBool(false)
+        drogaAtiva[i] = false
     end
 
-    -- estado de ativação por droga
-    local drogaAtiva  = { false, false, false, false }
-    -- índice da droga rodando no loop (só 1 por vez, mas checkboxes independentes)
-    -- Na verdade permitimos múltiplas ativas simultaneamente (threads separadas)
-
-    local ARMOUR_ALVO  = 200
-    local DROGA_DELAY  = 1500   -- ms entre tentativas
+    local ARMOUR_ALVO = 200
+    local DROGA_DELAY = 1500   -- ms entre tentativas
 
     local function getArmour()
-        -- getCharArmour retorna float 0-100 no SAMP standard
-        -- mas alguns servidores usam 0-100 → vamos pegar raw e comparar com 100
-        -- Ajuste se seu servidor usa escala diferente
         local ok, armour = pcall(getCharArmour, playerPed)
-        if ok then return armour else return 0 end
+        return ok and armour or 0
     end
 
     local function usarDroga(idx)
         local droga = DROGAS[idx]
         if not droga then return end
 
-        -- Ativa proteções
         rpcLigar()
-
-        -- Envia o comando
         sampSendChat(droga.cmd)
         sampAddChatMessage('[ShoxFarm] ' .. droga.label:gsub('|   |', '') .. ': ' .. droga.cmd .. ' enviado!', 0xFFAA00)
 
-        -- Desativa proteções após 600ms (tempo suficiente pra animação não prender)
+        -- Desativa proteção após 600ms
         lua_thread.create(function()
             wait(600)
             rpcDesligar()
@@ -193,14 +106,11 @@ return function(ctx)
         if drogaAtiva[idx] then return end
         drogaAtiva[idx]  = true
         chkDrogas[idx].v = true
-
-        local droga = DROGAS[idx]
-        sampAddChatMessage('[ShoxFarm] ' .. droga.label:gsub('|   |', '') .. ' ATIVADO', 0x00FF88)
+        sampAddChatMessage('[ShoxFarm] ' .. DROGAS[idx].label:gsub('|   |', '') .. ' ATIVADO', 0x00FF88)
 
         lua_thread.create(function()
             while drogaAtiva[idx] do
-                local armour = getArmour()
-                if armour < ARMOUR_ALVO then
+                if getArmour() < ARMOUR_ALVO then
                     usarDroga(idx)
                 end
                 wait(DROGA_DELAY)
@@ -212,15 +122,13 @@ return function(ctx)
         if not drogaAtiva[idx] then return end
         drogaAtiva[idx]  = false
         chkDrogas[idx].v = false
-        local droga = DROGAS[idx]
-        sampAddChatMessage('[ShoxFarm] ' .. droga.label:gsub('|   |', '') .. ' DESATIVADO', 0xFF6666)
+        sampAddChatMessage('[ShoxFarm] ' .. DROGAS[idx].label:gsub('|   |', '') .. ' DESATIVADO', 0xFF6666)
     end
 
     -- ===================================================================
-    --  EVENTO: onServerMessage (caixinha + juros)
+    --  EVENTO: mensagem do servidor
     -- ===================================================================
     local function onServerMessage(color, text)
-        -- Gatilho Juros Bancario → caixinha
         if cxAtivo then
             local limpo = text:gsub('{%x%x%x%x%x%x}', '')
             if limpo:lower():find('juros bancario') then
@@ -235,24 +143,31 @@ return function(ctx)
     -- ===================================================================
     --  GUI
     -- ===================================================================
-    local function pushChkStyle()
+    local function pushChk()
         imgui.PushStyleColor(imgui.Col.CheckMark,      imgui.ImVec4(0.85, 0.10, 0.10, 1.00))
         imgui.PushStyleColor(imgui.Col.FrameBg,        imgui.ImVec4(0.15, 0.10, 0.10, 1.00))
         imgui.PushStyleColor(imgui.Col.FrameBgHovered, imgui.ImVec4(0.25, 0.08, 0.08, 1.00))
         imgui.PushStyleColor(imgui.Col.FrameBgActive,  imgui.ImVec4(0.40, 0.06, 0.06, 1.00))
     end
+    local function popChk() imgui.PopStyleColor(4) end
 
-    local function popChkStyle()
-        imgui.PopStyleColor(4)
+    local function statusTag(on)
+        if on then
+            imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.00, 1.00, 0.55, 1.00))
+            imgui.Text("[ON]")
+        else
+            imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.55, 0.55, 0.55, 1.00))
+            imgui.Text("[OFF]")
+        end
+        imgui.PopStyleColor()
     end
 
     local function drawGui(W)
         imgui.Dummy(imgui.ImVec2(0, 6))
 
-        -- ── Título ───────────────────────────────────────────────
+        -- Título
         local titulo = "  Auto's"
-        local tw = imgui.CalcTextSize(titulo).x
-        imgui.SetCursorPosX((W - tw) * 0.5)
+        imgui.SetCursorPosX((W - imgui.CalcTextSize(titulo).x) * 0.5)
         imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.00, 0.80, 1.00, 1.00))
         imgui.Text(titulo)
         imgui.PopStyleColor()
@@ -261,33 +176,25 @@ return function(ctx)
         imgui.Text("------------------------------------------------")
         imgui.Dummy(imgui.ImVec2(0, 4))
 
-        -- ── Seção: Auto Caixinha ──────────────────────────────────
+        -- ── Caixinha ─────────────────────────────────────────────
         imgui.SetCursorPosX(20)
         imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.80, 0.80, 0.20, 1.00))
         imgui.Text("[ Caixinha ]")
         imgui.PopStyleColor()
         imgui.Dummy(imgui.ImVec2(0, 3))
 
-        pushChkStyle()
+        pushChk()
         imgui.SetCursorPosX(20)
         if imgui.Checkbox("|   |Auto caixinha", chkCaixinha) then
             if chkCaixinha.v then caixinhaLigar() else caixinhaDesligar() end
         end
-        popChkStyle()
+        popChk()
 
-        -- status caixinha
         imgui.SameLine()
         imgui.SetCursorPosX(W - 80)
-        if cxAtivo then
-            imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.00, 1.00, 0.55, 1.00))
-            imgui.Text("[ON]")
-        else
-            imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.55, 0.55, 0.55, 1.00))
-            imgui.Text("[OFF]")
-        end
-        imgui.PopStyleColor()
+        statusTag(cxAtivo)
 
-        imgui.Dummy(imgui.ImVec2(0, 4))
+        imgui.Dummy(imgui.ImVec2(0, 3))
         imgui.SetCursorPosX(20)
         imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.55, 0.55, 0.55, 1.00))
         imgui.Text("Timer: 30min  |  Gatilho: Juros Bancario")
@@ -298,7 +205,7 @@ return function(ctx)
         imgui.Text("------------------------------------------------")
         imgui.Dummy(imgui.ImVec2(0, 4))
 
-        -- ── Seção: Auto Drogas ────────────────────────────────────
+        -- ── Drogas ───────────────────────────────────────────────
         imgui.SetCursorPosX(20)
         imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.80, 0.80, 0.20, 1.00))
         imgui.Text("[ Drogas — para quando colete = 200 ]")
@@ -306,28 +213,16 @@ return function(ctx)
         imgui.Dummy(imgui.ImVec2(0, 5))
 
         for i, droga in ipairs(DROGAS) do
-            pushChkStyle()
+            pushChk()
             imgui.SetCursorPosX(20)
             if imgui.Checkbox(droga.label .. "##drg" .. i, chkDrogas[i]) then
-                if chkDrogas[i].v then
-                    iniciarDroga(i)
-                else
-                    pararDroga(i)
-                end
+                if chkDrogas[i].v then iniciarDroga(i) else pararDroga(i) end
             end
-            popChkStyle()
+            popChk()
 
-            -- status inline
             imgui.SameLine()
             imgui.SetCursorPosX(W - 80)
-            if drogaAtiva[i] then
-                imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.00, 1.00, 0.55, 1.00))
-                imgui.Text("[ON]")
-            else
-                imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.55, 0.55, 0.55, 1.00))
-                imgui.Text("[OFF]")
-            end
-            imgui.PopStyleColor()
+            statusTag(drogaAtiva[i])
 
             imgui.Dummy(imgui.ImVec2(0, 2))
         end
@@ -335,10 +230,10 @@ return function(ctx)
         imgui.Dummy(imgui.ImVec2(0, 6))
         imgui.SetCursorPosX(20)
         imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.50, 0.50, 0.50, 1.00))
-        imgui.TextWrapped("Proteção RPC ativa durante cada uso: freeze, anim, embriaguez, sinc. de armas.")
+        imgui.TextWrapped("Animacoes do servidor sao bloqueadas durante cada /usar...")
         imgui.PopStyleColor()
 
-        -- colete atual
+        -- Colete atual
         imgui.Dummy(imgui.ImVec2(0, 4))
         imgui.SetCursorPosX(20)
         local armourAtual = getArmour()
@@ -356,6 +251,8 @@ return function(ctx)
     return {
         drawGui         = drawGui,
         onServerMessage = onServerMessage,
-        isAtivo         = function() return cxAtivo or drogaAtiva[1] or drogaAtiva[2] or drogaAtiva[3] or drogaAtiva[4] end,
+        isAtivo         = function()
+            return cxAtivo or drogaAtiva[1] or drogaAtiva[2] or drogaAtiva[3] or drogaAtiva[4]
+        end,
     }
 end
