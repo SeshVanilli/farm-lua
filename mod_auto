@@ -6,7 +6,7 @@
                         Monitora colete: só para quando atingir 200.
                         Bloqueia animações do servidor durante todo o uso.
       • Auto Proteção → detecta veículo ou interior, envia /protecao,
-                        clica no botão 1 do dialog e aguarda 5 min para repetir.
+                        clica no botão 0 do dialog e aguarda 5 min para repetir.
 ]]
 
 local sampev = require 'lib.samp.events'
@@ -96,7 +96,7 @@ return function(ctx)
         block_anims = true
 
         local nome = DROGAS[drogaSelIdx].nome
-        sampAddChatMessage('[ShoxFarm] Auto' .. nome .. ' ATIVADO', 0x00FF88)
+        sampAddChatMessage('[ShoxFarm] Auto ' .. nome .. ' ATIVADO', 0x00FF88)
 
         lua_thread.create(function()
             while drogaAtiva do
@@ -117,7 +117,7 @@ return function(ctx)
         if not drogaAtiva then return end
         drogaAtiva = false
         chkDroga.v = false
-        sampAddChatMessage('[ShoxFarm] Auto' .. DROGAS[drogaSelIdx].nome .. ' DESATIVADO', 0xFF6666)
+        sampAddChatMessage('[ShoxFarm] Auto ' .. DROGAS[drogaSelIdx].nome .. ' DESATIVADO', 0xFF6666)
     end
 
     -- ===================================================================
@@ -125,19 +125,17 @@ return function(ctx)
     -- ===================================================================
     local protAtivo      = false
     local chkProt        = imgui.ImBool(false)
-    local PROT_COOLDOWN  = 5 * 60 * 1000   -- 5 minutos em ms
-    local PROT_DIALOG_TO = 8000            -- timeout aguardando dialog (ms)
+    local PROT_COOLDOWN  = 5 * 60 * 1000
+    local PROT_DIALOG_TO = 8000
 
-    -- estado interno da rotina
     local protDialogRecebido = false
     local protAguardandoCD   = false
-    local protCDRestante     = 0           -- ms restantes no cooldown (para exibir)
+    local protCDRestante     = 0
     local protCDTotal        = PROT_COOLDOWN
 
-    -- verifica se o player está num veículo ou interior
     local function estaEmVeiculoOuInterior()
-        local emVeiculo  = isCharInAnyCar(playerPed)
-        local interior   = getActiveInterior() ~= 0
+        local emVeiculo = isCharInAnyCar(playerPed)
+        local interior  = getActiveInterior() ~= 0
         return emVeiculo or interior
     end
 
@@ -149,17 +147,14 @@ return function(ctx)
 
         lua_thread.create(function()
             while protAtivo do
-                -- aguarda entrar em veículo ou interior
                 while protAtivo and not estaEmVeiculoOuInterior() do
                     wait(1000)
                 end
                 if not protAtivo then break end
 
-                -- envia o comando
                 sampSendChat("/protecao")
                 sampAddChatMessage('[ShoxFarm] /protecao enviado!', 0xFFAA00)
 
-                -- aguarda o dialog aparecer (timeout)
                 protDialogRecebido = false
                 local elapsed = 0
                 while protAtivo and not protDialogRecebido and elapsed < PROT_DIALOG_TO do
@@ -168,7 +163,6 @@ return function(ctx)
                 end
 
                 if protDialogRecebido then
-                    -- dialog confirmado → inicia cooldown de 5 min
                     sampAddChatMessage('[ShoxFarm] Protecao confirmada! Aguardando 5 min...', 0x00FF88)
                     protAguardandoCD = true
                     protCDRestante   = PROT_COOLDOWN
@@ -181,7 +175,6 @@ return function(ctx)
                     protAguardandoCD = false
                     protCDRestante   = 0
                 else
-                    -- dialog não apareceu → pequena pausa antes de tentar de novo
                     sampAddChatMessage('[ShoxFarm] Dialog nao detectado, tentando novamente em 10s...', 0xFF6666)
                     wait(10000)
                 end
@@ -214,16 +207,18 @@ return function(ctx)
     end
 
     -- ===================================================================
-    --  EVENTO: dialog do servidor → clica botão 1 e sinaliza proteção
+    --  EVENTO: dialog do servidor → clica Fechar e sinaliza proteção
     -- ===================================================================
     function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
         if protAtivo then
-            -- clica no botão 1 (confirmar proteção)
-            lua_thread.create(function()
-                wait(150)
-                sampSendDialogResponse(dialogId, 1, -1, "")
-                protDialogRecebido = true
-            end)
+            local tituloLimpo = title:gsub('{%x%x%x%x%x%x}', ''):lower()
+            if tituloLimpo:find('protecao') then
+                lua_thread.create(function()
+                    wait(150)
+                    sampSendDialogResponse(dialogId, 0, -1, "")
+                    protDialogRecebido = true
+                end)
+            end
         end
     end
 
@@ -382,7 +377,7 @@ return function(ctx)
         imgui.Dummy(imgui.ImVec2(0, 4))
         imgui.SetCursorPosX(20)
         imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.55, 0.55, 0.55, 1.00))
-        imgui.Text("Cooldown: 5 min  |  Clica botao 1 automaticamente")
+        imgui.Text("Cooldown: 5 min  |  Clica Fechar automaticamente")
         imgui.PopStyleColor()
 
         -- barra de cooldown
