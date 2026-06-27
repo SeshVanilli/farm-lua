@@ -2,9 +2,9 @@
     mod_auto.lua  –  Auto's
     Módulo do ShoxFarm:
       • Auto Caixinha → /caixinha a cada 30 min + gatilho "Juros Bancario"
-      • Auto Drogas   → /usarlsd | /usarcrack | /usarcocaina | /usarmaconha
+      • Auto Drogas   → 1 checkbox + seletor de droga
                         Monitora colete: só para quando atingir 200.
-                        Bloqueia animações do servidor durante todo o ciclo de uso.
+                        Bloqueia animações do servidor durante todo o uso.
 ]]
 
 local sampev = require 'lib.samp.events'
@@ -14,8 +14,7 @@ return function(ctx)
     local U = ctx.U
 
     -- ===================================================================
-    --  PROTEÇÃO RPC — bloqueia animações enquanto alguma droga estiver ativa
-    --  flag ligada pela thread do loop, não por timer
+    --  PROTEÇÃO RPC — bloqueia animações enquanto droga estiver ativa
     -- ===================================================================
     local block_anims = false
 
@@ -64,67 +63,63 @@ return function(ctx)
     --  AUTO DROGAS
     -- ===================================================================
     local DROGAS = {
-        { label = "|   |AutoLsd",     cmd = "/usarlsd"     },
-        { label = "|   |AutoCrack",   cmd = "/usarcrack"   },
-        { label = "|   |AutoCocaina", cmd = "/usarcocaina" },
-        { label = "|   |AutoMaconha", cmd = "/usarmaconha" },
+        { nome = "LSD",     cmd = "/usarlsd"     },
+        { nome = "Crack",   cmd = "/usarcrack"   },
+        { nome = "Cocaina", cmd = "/usarcocaina" },
+        { nome = "Maconha", cmd = "/usarmaconha" },
     }
 
-    local chkDrogas  = {}
-    local drogaAtiva = {}
-    for i = 1, #DROGAS do
-        chkDrogas[i]  = imgui.ImBool(false)
-        drogaAtiva[i] = false
+    -- Estado
+    local drogaAtiva   = false
+    local chkDroga     = imgui.ImBool(false)
+    local drogaSel     = imgui.ImInt(0)   -- índice 0-based do combo
+    local ARMOUR_ALVO  = 200
+    local CICLO_MS     = 15000
+
+    -- Monta array de nomes pra o combo (null-terminated)
+    local comboBuf = ""
+    for _, d in ipairs(DROGAS) do
+        comboBuf = comboBuf .. d.nome .. "\0"
     end
-
-    -- Contador de drogas ativas — block_anims fica true enquanto > 0
-    local totalAtivas = 0
-
-    local ARMOUR_ALVO = 200
-    local CICLO_MS    = 15000  -- intervalo entre um /usar e o próximo (duração da animação + folga)
+    comboBuf = comboBuf .. "\0"
 
     local function getArmour()
         local ok, armour = pcall(getCharArmour, playerPed)
         return ok and armour or 0
     end
 
-    local function iniciarDroga(idx)
-        if drogaAtiva[idx] then return end
-        drogaAtiva[idx]  = true
-        chkDrogas[idx].v = true
-        totalAtivas = totalAtivas + 1
-        block_anims = true   -- liga imediatamente ao ativar
+    local function drogaLigar()
+        if drogaAtiva then return end
+        drogaAtiva    = true
+        chkDroga.v    = true
+        block_anims   = true   -- liga bloqueio imediatamente
 
-        sampAddChatMessage('[ShoxFarm] ' .. DROGAS[idx].label:gsub('|   |', '') .. ' ATIVADO', 0x00FF88)
+        local idx  = drogaSel[0] + 1   -- converte pra 1-based
+        local nome = DROGAS[idx].nome
+        sampAddChatMessage('[ShoxFarm] Auto' .. nome .. ' ATIVADO', 0x00FF88)
 
         lua_thread.create(function()
-            while drogaAtiva[idx] do
+            while drogaAtiva do
+                local idx_cur = drogaSel[0] + 1
                 if getArmour() < ARMOUR_ALVO then
-                    -- block_anims já está true desde que foi ativado
-                    sampSendChat(DROGAS[idx].cmd)
-                    sampAddChatMessage('[ShoxFarm] ' .. DROGAS[idx].cmd .. ' enviado!', 0xFFAA00)
-                    -- espera a animação toda antes de tentar de novo
+                    sampSendChat(DROGAS[idx_cur].cmd)
+                    sampAddChatMessage('[ShoxFarm] ' .. DROGAS[idx_cur].cmd .. ' enviado!', 0xFFAA00)
                     wait(CICLO_MS)
                 else
-                    -- colete cheio, checa de novo em 1s (bloqueio continua ativo)
                     wait(1000)
                 end
             end
-            -- saiu do loop: decrementa e desliga bloqueio se não há mais drogas ativas
-            totalAtivas = totalAtivas - 1
-            if totalAtivas <= 0 then
-                totalAtivas = 0
-                block_anims = false
-            end
+            block_anims = false
         end)
     end
 
-    local function pararDroga(idx)
-        if not drogaAtiva[idx] then return end
-        drogaAtiva[idx]  = false
-        chkDrogas[idx].v = false
-        sampAddChatMessage('[ShoxFarm] ' .. DROGAS[idx].label:gsub('|   |', '') .. ' DESATIVADO', 0xFF6666)
-        -- block_anims vai ser desligado pela thread quando ela sair do while
+    local function drogaDesligar()
+        if not drogaAtiva then return end
+        drogaAtiva  = false
+        chkDroga.v  = false
+        local idx   = drogaSel[0] + 1
+        sampAddChatMessage('[ShoxFarm] Auto' .. DROGAS[idx].nome .. ' DESATIVADO', 0xFF6666)
+        -- block_anims desligado pela thread ao sair do while
     end
 
     -- ===================================================================
@@ -152,6 +147,19 @@ return function(ctx)
         imgui.PushStyleColor(imgui.Col.FrameBgActive,  imgui.ImVec4(0.40, 0.06, 0.06, 1.00))
     end
     local function popChk() imgui.PopStyleColor(4) end
+
+    local function pushCombo()
+        imgui.PushStyleColor(imgui.Col.FrameBg,        imgui.ImVec4(0.15, 0.08, 0.08, 1.00))
+        imgui.PushStyleColor(imgui.Col.FrameBgHovered, imgui.ImVec4(0.25, 0.06, 0.06, 1.00))
+        imgui.PushStyleColor(imgui.Col.FrameBgActive,  imgui.ImVec4(0.35, 0.05, 0.05, 1.00))
+        imgui.PushStyleColor(imgui.Col.Button,         imgui.ImVec4(0.55, 0.05, 0.05, 1.00))
+        imgui.PushStyleColor(imgui.Col.ButtonHovered,  imgui.ImVec4(0.70, 0.08, 0.08, 1.00))
+        imgui.PushStyleColor(imgui.Col.Header,         imgui.ImVec4(0.55, 0.05, 0.05, 1.00))
+        imgui.PushStyleColor(imgui.Col.HeaderHovered,  imgui.ImVec4(0.70, 0.08, 0.08, 1.00))
+        imgui.PushStyleColor(imgui.Col.HeaderActive,   imgui.ImVec4(0.85, 0.10, 0.10, 1.00))
+        imgui.PushStyleColor(imgui.Col.PopupBg,        imgui.ImVec4(0.08, 0.04, 0.04, 0.97))
+    end
+    local function popCombo() imgui.PopStyleColor(9) end
 
     local function statusTag(on)
         if on then
@@ -210,22 +218,39 @@ return function(ctx)
         imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.80, 0.80, 0.20, 1.00))
         imgui.Text("[ Drogas — para quando colete = 200 ]")
         imgui.PopStyleColor()
-        imgui.Dummy(imgui.ImVec2(0, 5))
+        imgui.Dummy(imgui.ImVec2(0, 6))
 
-        for i, droga in ipairs(DROGAS) do
-            pushChk()
-            imgui.SetCursorPosX(20)
-            if imgui.Checkbox(droga.label .. "##drg" .. i, chkDrogas[i]) then
-                if chkDrogas[i].v then iniciarDroga(i) else pararDroga(i) end
+        -- Seletor de droga (combo)
+        pushCombo()
+        imgui.SetCursorPosX(20)
+        imgui.PushItemWidth(W - 40)
+        if imgui.Combo("##drogasel", drogaSel, comboBuf) then
+            -- se trocou enquanto ativo, reinicia com a nova droga
+            if drogaAtiva then
+                drogaDesligar()
+                lua_thread.create(function()
+                    wait(100)
+                    drogaLigar()
+                end)
             end
-            popChk()
-            imgui.SameLine()
-            imgui.SetCursorPosX(W - 80)
-            statusTag(drogaAtiva[i])
-            imgui.Dummy(imgui.ImVec2(0, 2))
         end
+        imgui.PopItemWidth()
+        popCombo()
 
         imgui.Dummy(imgui.ImVec2(0, 6))
+
+        -- Checkbox único
+        pushChk()
+        imgui.SetCursorPosX(20)
+        if imgui.Checkbox("|   |Auto Droga", chkDroga) then
+            if chkDroga.v then drogaLigar() else drogaDesligar() end
+        end
+        popChk()
+        imgui.SameLine()
+        imgui.SetCursorPosX(W - 80)
+        statusTag(drogaAtiva)
+
+        imgui.Dummy(imgui.ImVec2(0, 8))
         imgui.SetCursorPosX(20)
         imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.50, 0.50, 0.50, 1.00))
         imgui.TextWrapped("Animacoes bloqueadas do momento da ativacao ate desativar.")
@@ -248,8 +273,6 @@ return function(ctx)
     return {
         drawGui         = drawGui,
         onServerMessage = onServerMessage,
-        isAtivo         = function()
-            return cxAtivo or drogaAtiva[1] or drogaAtiva[2] or drogaAtiva[3] or drogaAtiva[4]
-        end,
+        isAtivo         = function() return cxAtivo or drogaAtiva end,
     }
 end
