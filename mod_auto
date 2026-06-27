@@ -1,1 +1,153 @@
+--[[
+    mod_auto.lua  –  Auto Caixinha
+    Módulo do ShoxFarm que envia /caixinha automaticamente:
+      • A cada 30 minutos (timer)
+      • Quando o chat detecta a frase "Juros Bancario" em qualquer mensagem do servidor
 
+    Retorna uma factory: function(ctx) → módulo
+    ctx.U          → utils compartilhado
+    ctx.playerNick → nick do player (referência, pode mudar)
+]]
+
+local sampev = require 'lib.samp.events'
+local imgui  = require 'imgui'
+
+-- ===================================================================
+--  FACTORY
+-- ===================================================================
+return function(ctx)
+    local U = ctx.U
+
+    -- ─── Estado interno ──────────────────────────────────────────
+    local ativo         = false          -- toggle da checkbox
+    local INTERVALO_MS  = 30 * 60 * 1000 -- 30 minutos em ms
+    local timerThread   = nil            -- referência à lua_thread do timer
+
+    -- imgui state (bool nativo FFI para a checkbox)
+    local chk = imgui.ImBool(false)
+
+    -- ─── Helpers ─────────────────────────────────────────────────
+    local function enviarCaixinha()
+        if isSampAvailable() then
+            sampSendChat("/caixinha")
+            sampAddChatMessage('[ShoxFarm] Auto Caixinha: /caixinha enviado!', 0x00CFFF)
+        end
+    end
+
+    -- ─── Ligar / Desligar ────────────────────────────────────────
+    local function ligar()
+        if ativo then return end
+        ativo = true
+        chk.v = true
+
+        -- Envia imediatamente ao ativar
+        enviarCaixinha()
+
+        -- Cria a thread de loop a cada 30 min
+        timerThread = lua_thread.create(function()
+            while ativo do
+                wait(INTERVALO_MS)
+                if ativo and isSampAvailable() then
+                    enviarCaixinha()
+                end
+            end
+        end)
+
+        sampAddChatMessage('[ShoxFarm] Auto Caixinha ATIVADO (30 min + Juros Bancario)', 0x00FF88)
+    end
+
+    local function desligar()
+        if not ativo then return end
+        ativo = false
+        chk.v = false
+        -- A thread vai parar sozinha pois `ativo` virou false
+        sampAddChatMessage('[ShoxFarm] Auto Caixinha DESATIVADO', 0xFF6666)
+    end
+
+    local function toggle()
+        if ativo then desligar() else ligar() end
+    end
+
+    -- ─── Evento: mensagem do servidor ────────────────────────────
+    -- Retorna true se o módulo consumiu/processou (o loader pode usar isso)
+    local function onServerMessage(color, text)
+        if not ativo then return end
+        -- Detecta "Juros Bancario" (case-insensitive, ignora cores {RRGGBB})
+        local limpo = text:gsub('{%x%x%x%x%x%x}', '')
+        if limpo:lower():find('juros bancario') then
+            lua_thread.create(function()
+                wait(300) -- pequeno delay pra não conflitar com flood-check
+                enviarCaixinha()
+            end)
+        end
+    end
+
+    -- ─── GUI ─────────────────────────────────────────────────────
+    --[[
+        drawGui(W) → chamado pelo ShoxFarm quando paginaAtual == 6
+        (você precisa adicionar o botão na HOME e a entrada no elseif)
+    ]]
+    local function drawGui(W)
+        imgui.Dummy(imgui.ImVec2(0, 8))
+
+        -- ── Título da seção ──────────────────────────────────────
+        local titulo = "  Auto Caixinha"
+        local tw = imgui.CalcTextSize(titulo).x
+        imgui.SetCursorPosX((W - tw) * 0.5)
+        imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.00, 0.80, 1.00, 1.00))
+        imgui.Text(titulo)
+        imgui.PopStyleColor()
+
+        imgui.Dummy(imgui.ImVec2(0, 6))
+        imgui.SetCursorPosX(20)
+        imgui.Text("------------------------------------------------")
+        imgui.Dummy(imgui.ImVec2(0, 8))
+
+        -- ── Checkbox principal ───────────────────────────────────
+        -- Usa o estilo de checkbox do ShoxFarm (vermelho/branco)
+        imgui.PushStyleColor(imgui.Col.CheckMark,        imgui.ImVec4(0.85, 0.10, 0.10, 1.00))
+        imgui.PushStyleColor(imgui.Col.FrameBg,          imgui.ImVec4(0.15, 0.10, 0.10, 1.00))
+        imgui.PushStyleColor(imgui.Col.FrameBgHovered,   imgui.ImVec4(0.25, 0.08, 0.08, 1.00))
+        imgui.PushStyleColor(imgui.Col.FrameBgActive,    imgui.ImVec4(0.40, 0.06, 0.06, 1.00))
+
+        imgui.SetCursorPosX(20)
+        if imgui.Checkbox("|   |Auto caixinha", chk) then
+            -- Usuário clicou na checkbox → sincroniza estado
+            if chk.v then ligar() else desligar() end
+        end
+
+        imgui.PopStyleColor(4)
+
+        imgui.Dummy(imgui.ImVec2(0, 10))
+        imgui.SetCursorPosX(20)
+
+        -- ── Status ───────────────────────────────────────────────
+        if ativo then
+            imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.00, 1.00, 0.55, 1.00))
+            imgui.Text("Status: ATIVO")
+            imgui.PopStyleColor()
+        else
+            imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(1.00, 0.30, 0.30, 1.00))
+            imgui.Text("Status: INATIVO")
+            imgui.PopStyleColor()
+        end
+
+        imgui.Dummy(imgui.ImVec2(0, 8))
+        imgui.SetCursorPosX(20)
+
+        -- ── Info box ─────────────────────────────────────────────
+        imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.70, 0.70, 0.70, 1.00))
+        imgui.TextWrapped("Envia /caixinha automaticamente a cada 30 minutos e sempre que 'Juros Bancario' aparecer no chat.")
+        imgui.PopStyleColor()
+    end
+
+    -- ─── Interface pública do módulo ─────────────────────────────
+    return {
+        drawGui         = drawGui,
+        onServerMessage = onServerMessage,
+        isAtivo         = function() return ativo end,
+        ligar           = ligar,
+        desligar        = desligar,
+        toggle          = toggle,
+    }
+end
