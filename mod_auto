@@ -502,5 +502,33 @@ return function(ctx)
         isAtivo         = function()
             return cxAtivo or drogaAtiva or protAtivo or kitAtivo[1] or kitAtivo[2]
         end,
+
+        -- salvar / carregar estado
+        getEstado = function()
+            return {
+                caixinha  = cxAtivo,
+                droga     = drogaAtiva,
+                drogaIdx  = drogaSelIdx,
+                protecao  = protAtivo,
+                kit1      = kitAtivo[1],
+                kit2      = kitAtivo[2],
+            }
+        end,
+        carregarEstado = function(s)
+            -- sincroniza checkboxes
+            chkCaixinha.v  = s.caixinha
+            chkDroga.v     = s.droga
+            chkProt.v      = s.protecao
+            chkKit[1].v    = s.kit1
+            chkKit[2].v    = s.kit2
+            -- sincroniza combo de droga
+            drogaSelIdx    = s.drogaIdx
+            drogaSelImm.v  = s.drogaIdx - 1
+            -- religa os que estavam ativos
+            if s.caixinha then caixinhaLigar() end
+            if s.droga    then drogaLigar()    end
+            if s.protecao then protLigar()     end
+            if s.kit1     then kitLigar(1)     end
+            if s.kit2     then kitLigar(2)     end
+        end,
     }
-end
