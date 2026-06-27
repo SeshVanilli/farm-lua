@@ -4,7 +4,7 @@
       • Auto Caixinha → /caixinha a cada 30 min + gatilho "Juros Bancario"
       • Auto Drogas   → /usarlsd | /usarcrack | /usarcocaina | /usarmaconha
                         Monitora colete: só para quando atingir 200.
-                        Bloqueia animações do servidor durante cada /usar...
+                        Bloqueia animações do servidor durante todo o ciclo de uso.
 ]]
 
 local sampev = require 'lib.samp.events'
@@ -14,18 +14,16 @@ return function(ctx)
     local U = ctx.U
 
     -- ===================================================================
-    --  PROTEÇÃO RPC  (apenas bloquear animações durante o /usar...)
+    --  PROTEÇÃO RPC — bloqueia animações enquanto alguma droga estiver ativa
+    --  flag ligada pela thread do loop, não por timer
     -- ===================================================================
-    local block_anims = false   -- true somente nos instantes do comando
+    local block_anims = false
 
     function sampev.onApplyPlayerAnimation(playerId, ...)
         if block_anims and playerId == select(2, sampGetPlayerIdByCharHandle(playerPed)) then
             return false
         end
     end
-
-    local function rpcLigar()   block_anims = true  end
-    local function rpcDesligar() block_anims = false end
 
     -- ===================================================================
     --  AUTO CAIXINHA
@@ -79,41 +77,44 @@ return function(ctx)
         drogaAtiva[i] = false
     end
 
+    -- Contador de drogas ativas — block_anims fica true enquanto > 0
+    local totalAtivas = 0
+
     local ARMOUR_ALVO = 200
-    local DROGA_DELAY = 1500   -- ms entre tentativas
+    local CICLO_MS    = 15000  -- intervalo entre um /usar e o próximo (duração da animação + folga)
 
     local function getArmour()
         local ok, armour = pcall(getCharArmour, playerPed)
         return ok and armour or 0
     end
 
-    local function usarDroga(idx)
-        local droga = DROGAS[idx]
-        if not droga then return end
-
-        rpcLigar()
-        sampSendChat(droga.cmd)
-        sampAddChatMessage('[ShoxFarm] ' .. droga.label:gsub('|   |', '') .. ': ' .. droga.cmd .. ' enviado!', 0xFFAA00)
-
-        -- Desativa proteção após 600ms
-        lua_thread.create(function()
-            wait(600)
-            rpcDesligar()
-        end)
-    end
-
     local function iniciarDroga(idx)
         if drogaAtiva[idx] then return end
         drogaAtiva[idx]  = true
         chkDrogas[idx].v = true
+        totalAtivas = totalAtivas + 1
+        block_anims = true   -- liga imediatamente ao ativar
+
         sampAddChatMessage('[ShoxFarm] ' .. DROGAS[idx].label:gsub('|   |', '') .. ' ATIVADO', 0x00FF88)
 
         lua_thread.create(function()
             while drogaAtiva[idx] do
                 if getArmour() < ARMOUR_ALVO then
-                    usarDroga(idx)
+                    -- block_anims já está true desde que foi ativado
+                    sampSendChat(DROGAS[idx].cmd)
+                    sampAddChatMessage('[ShoxFarm] ' .. DROGAS[idx].cmd .. ' enviado!', 0xFFAA00)
+                    -- espera a animação toda antes de tentar de novo
+                    wait(CICLO_MS)
+                else
+                    -- colete cheio, checa de novo em 1s (bloqueio continua ativo)
+                    wait(1000)
                 end
-                wait(DROGA_DELAY)
+            end
+            -- saiu do loop: decrementa e desliga bloqueio se não há mais drogas ativas
+            totalAtivas = totalAtivas - 1
+            if totalAtivas <= 0 then
+                totalAtivas = 0
+                block_anims = false
             end
         end)
     end
@@ -123,6 +124,7 @@ return function(ctx)
         drogaAtiva[idx]  = false
         chkDrogas[idx].v = false
         sampAddChatMessage('[ShoxFarm] ' .. DROGAS[idx].label:gsub('|   |', '') .. ' DESATIVADO', 0xFF6666)
+        -- block_anims vai ser desligado pela thread quando ela sair do while
     end
 
     -- ===================================================================
@@ -165,7 +167,6 @@ return function(ctx)
     local function drawGui(W)
         imgui.Dummy(imgui.ImVec2(0, 6))
 
-        -- Título
         local titulo = "  Auto's"
         imgui.SetCursorPosX((W - imgui.CalcTextSize(titulo).x) * 0.5)
         imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.00, 0.80, 1.00, 1.00))
@@ -189,7 +190,6 @@ return function(ctx)
             if chkCaixinha.v then caixinhaLigar() else caixinhaDesligar() end
         end
         popChk()
-
         imgui.SameLine()
         imgui.SetCursorPosX(W - 80)
         statusTag(cxAtivo)
@@ -219,21 +219,18 @@ return function(ctx)
                 if chkDrogas[i].v then iniciarDroga(i) else pararDroga(i) end
             end
             popChk()
-
             imgui.SameLine()
             imgui.SetCursorPosX(W - 80)
             statusTag(drogaAtiva[i])
-
             imgui.Dummy(imgui.ImVec2(0, 2))
         end
 
         imgui.Dummy(imgui.ImVec2(0, 6))
         imgui.SetCursorPosX(20)
         imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.50, 0.50, 0.50, 1.00))
-        imgui.TextWrapped("Animacoes do servidor sao bloqueadas durante cada /usar...")
+        imgui.TextWrapped("Animacoes bloqueadas do momento da ativacao ate desativar.")
         imgui.PopStyleColor()
 
-        -- Colete atual
         imgui.Dummy(imgui.ImVec2(0, 4))
         imgui.SetCursorPosX(20)
         local armourAtual = getArmour()
