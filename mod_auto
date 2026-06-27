@@ -253,6 +253,8 @@ return function(ctx)
 
     -- ===================================================================
     --  EVENTO: dialog do servidor → roteado pelo loader
+    --  Retorna true para SUPRIMIR o dialog (não aparece na tela)
+    --  Retorna false para deixar o dialog aparecer normalmente
     -- ===================================================================
     local function onShowDialog(dialogId, style, tituloLimpo, textoDialog, conteudo)
         if not protAtivo then return false end
@@ -264,6 +266,7 @@ return function(ctx)
                 sampSendDialogResponse(dialogId, 1, -1, "")
                 protDialogRecebido = true
             end)
+            return true  -- suprime o dialog da tela para o sampSendDialogResponse funcionar
         end
 
         return false
