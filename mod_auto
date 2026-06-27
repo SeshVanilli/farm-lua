@@ -7,6 +7,8 @@
                         Bloqueia animações do servidor durante todo o uso.
       • Auto Proteção → detecta veículo ou interior, envia /protecao,
                         clica no botão 0 do dialog e aguarda 5 min para repetir.
+      • Auto Kit Sócio → /kitsocio 1 e /kitsocio 2 separados,
+                         envia apenas quando sem colete E HP < 101.
 ]]
 
 local sampev = require 'lib.samp.events'
@@ -87,6 +89,11 @@ return function(ctx)
     local function getArmour()
         local ok, armour = pcall(getCharArmour, playerPed)
         return ok and armour or 0
+    end
+
+    local function getHP()
+        local ok, hp = pcall(getCharHealth, playerPed)
+        return ok and hp or 100
     end
 
     local function drogaLigar()
@@ -192,6 +199,44 @@ return function(ctx)
     end
 
     -- ===================================================================
+    --  AUTO KIT SÓCIO
+    -- ===================================================================
+    local KITS = {
+        { nome = "Kit Socio 1", cmd = "/kitsocio 1" },
+        { nome = "Kit Socio 2", cmd = "/kitsocio 2" },
+    }
+
+    local kitAtivo  = { false, false }
+    local chkKit    = { imgui.ImBool(false), imgui.ImBool(false) }
+    local KIT_CICLO  = 3000
+    local KIT_HP_MIN  = 101
+    local KIT_ARM_MIN = 1
+
+    local function kitLigar(i)
+        if kitAtivo[i] then return end
+        kitAtivo[i]  = true
+        chkKit[i].v  = true
+        sampAddChatMessage('[ShoxFarm] Auto ' .. KITS[i].nome .. ' ATIVADO', 0x00FF88)
+
+        lua_thread.create(function()
+            while kitAtivo[i] do
+                if getArmour() < KIT_ARM_MIN and getHP() < KIT_HP_MIN then
+                    sampSendChat(KITS[i].cmd)
+                    sampAddChatMessage('[ShoxFarm] ' .. KITS[i].cmd .. ' enviado!', 0xFFAA00)
+                end
+                wait(KIT_CICLO)
+            end
+        end)
+    end
+
+    local function kitDesligar(i)
+        if not kitAtivo[i] then return end
+        kitAtivo[i]  = false
+        chkKit[i].v  = false
+        sampAddChatMessage('[ShoxFarm] Auto ' .. KITS[i].nome .. ' DESATIVADO', 0xFF6666)
+    end
+
+    -- ===================================================================
     --  EVENTO: mensagem do servidor
     -- ===================================================================
     local function onServerMessage(color, text)
@@ -207,19 +252,21 @@ return function(ctx)
     end
 
     -- ===================================================================
-    --  EVENTO: dialog do servidor → clica Fechar e sinaliza proteção
+    --  EVENTO: dialog do servidor → roteado pelo loader
     -- ===================================================================
-    function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
-        if protAtivo then
-            local tituloLimpo = title:gsub('{%x%x%x%x%x%x}', ''):lower()
-            if tituloLimpo:find('protecao') then
-                lua_thread.create(function()
-                    wait(150)
-                    sampSendDialogResponse(dialogId, 0, -1, "")
-                    protDialogRecebido = true
-                end)
-            end
+    local function onShowDialog(dialogId, style, tituloLimpo, textoDialog, conteudo)
+        if not protAtivo then return false end
+
+        if tituloLimpo:lower():find('protecao', 1, true) then
+            sampAddChatMessage('[ShoxFarm] Dialog protecao detectado! Fechando...', 0x00FF88)
+            lua_thread.create(function()
+                wait(150)
+                sampSendDialogResponse(dialogId, 0, -1, "")
+                protDialogRecebido = true
+            end)
         end
+
+        return false
     end
 
     -- ===================================================================
@@ -380,7 +427,6 @@ return function(ctx)
         imgui.Text("Cooldown: 5 min  |  Clica Fechar automaticamente")
         imgui.PopStyleColor()
 
-        -- barra de cooldown
         if protAtivo and protAguardandoCD then
             imgui.Dummy(imgui.ImVec2(0, 4))
             imgui.SetCursorPosX(20)
@@ -407,6 +453,42 @@ return function(ctx)
             imgui.PopStyleColor()
         end
 
+        imgui.Dummy(imgui.ImVec2(0, 8))
+        imgui.SetCursorPosX(20)
+        imgui.Text("------------------------------------------------")
+        imgui.Dummy(imgui.ImVec2(0, 4))
+
+        -- ── Kit Sócio ────────────────────────────────────────────
+        imgui.SetCursorPosX(20)
+        imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.80, 0.80, 0.20, 1.00))
+        imgui.Text("[ Kit Socio — sem colete e HP < 101 ]")
+        imgui.PopStyleColor()
+        imgui.Dummy(imgui.ImVec2(0, 6))
+
+        for i = 1, 2 do
+            pushChk()
+            imgui.SetCursorPosX(20)
+            if imgui.Checkbox("|   |Auto /kitsocio " .. i, chkKit[i]) then
+                if chkKit[i].v then kitLigar(i) else kitDesligar(i) end
+            end
+            popChk()
+            imgui.SameLine()
+            imgui.SetCursorPosX(W - 80)
+            statusTag(kitAtivo[i])
+            if i == 1 then imgui.Dummy(imgui.ImVec2(0, 4)) end
+        end
+
+        imgui.Dummy(imgui.ImVec2(0, 4))
+        imgui.SetCursorPosX(20)
+        local hpAtual  = getHP()
+        local armKit   = getArmour()
+        local corKit   = (armKit < KIT_ARM_MIN and hpAtual < KIT_HP_MIN)
+            and imgui.ImVec4(1.00, 0.30, 0.00, 1.00)
+            or  imgui.ImVec4(0.00, 1.00, 0.55, 1.00)
+        imgui.PushStyleColor(imgui.Col.Text, corKit)
+        imgui.Text(string.format("HP: %.0f  |  Colete: %.0f", hpAtual, armKit))
+        imgui.PopStyleColor()
+
         imgui.Dummy(imgui.ImVec2(0, 6))
     end
 
@@ -416,6 +498,9 @@ return function(ctx)
     return {
         drawGui         = drawGui,
         onServerMessage = onServerMessage,
-        isAtivo         = function() return cxAtivo or drogaAtiva or protAtivo end,
+        onShowDialog    = onShowDialog,
+        isAtivo         = function()
+            return cxAtivo or drogaAtiva or protAtivo or kitAtivo[1] or kitAtivo[2]
+        end,
     }
 end
