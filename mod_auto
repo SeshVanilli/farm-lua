@@ -5,6 +5,8 @@
       • Auto Drogas   → 1 checkbox + seletor de droga
                         Monitora colete: só para quando atingir 200.
                         Bloqueia animações do servidor durante todo o uso.
+      • Auto Proteção → detecta veículo ou interior, envia /protecao,
+                        clica no botão 1 do dialog e aguarda 5 min para repetir.
 ]]
 
 local sampev = require 'lib.samp.events'
@@ -69,17 +71,13 @@ return function(ctx)
         { nome = "Maconha", cmd = "/usarmaconha" },
     }
 
-    -- índice selecionado como inteiro Lua simples (1-based)
     local drogaSelIdx  = 1
-    -- ImInt só pra passar pro Combo do imgui (0-based)
     local drogaSelImm  = imgui.ImInt(0)
-
     local drogaAtiva   = false
     local chkDroga     = imgui.ImBool(false)
     local ARMOUR_ALVO  = 200
     local CICLO_MS     = 15000
 
-    -- string null-terminated pro Combo
     local comboBuf = ""
     for _, d in ipairs(DROGAS) do
         comboBuf = comboBuf .. d.nome .. "\0"
@@ -123,6 +121,84 @@ return function(ctx)
     end
 
     -- ===================================================================
+    --  AUTO PROTEÇÃO
+    -- ===================================================================
+    local protAtivo      = false
+    local chkProt        = imgui.ImBool(false)
+    local PROT_COOLDOWN  = 5 * 60 * 1000   -- 5 minutos em ms
+    local PROT_DIALOG_TO = 8000            -- timeout aguardando dialog (ms)
+
+    -- estado interno da rotina
+    local protDialogRecebido = false
+    local protAguardandoCD   = false
+    local protCDRestante     = 0           -- ms restantes no cooldown (para exibir)
+    local protCDTotal        = PROT_COOLDOWN
+
+    -- verifica se o player está num veículo ou interior
+    local function estaEmVeiculoOuInterior()
+        local emVeiculo  = isCharInAnyCar(playerPed)
+        local interior   = getActiveInterior() ~= 0
+        return emVeiculo or interior
+    end
+
+    local function protLigar()
+        if protAtivo then return end
+        protAtivo = true
+        chkProt.v = true
+        sampAddChatMessage('[ShoxFarm] Auto Protecao ATIVADO', 0x00FF88)
+
+        lua_thread.create(function()
+            while protAtivo do
+                -- aguarda entrar em veículo ou interior
+                while protAtivo and not estaEmVeiculoOuInterior() do
+                    wait(1000)
+                end
+                if not protAtivo then break end
+
+                -- envia o comando
+                sampSendChat("/protecao")
+                sampAddChatMessage('[ShoxFarm] /protecao enviado!', 0xFFAA00)
+
+                -- aguarda o dialog aparecer (timeout)
+                protDialogRecebido = false
+                local elapsed = 0
+                while protAtivo and not protDialogRecebido and elapsed < PROT_DIALOG_TO do
+                    wait(200)
+                    elapsed = elapsed + 200
+                end
+
+                if protDialogRecebido then
+                    -- dialog confirmado → inicia cooldown de 5 min
+                    sampAddChatMessage('[ShoxFarm] Protecao confirmada! Aguardando 5 min...', 0x00FF88)
+                    protAguardandoCD = true
+                    protCDRestante   = PROT_COOLDOWN
+                    local tick = 0
+                    while protAtivo and tick < PROT_COOLDOWN do
+                        wait(1000)
+                        tick           = tick + 1000
+                        protCDRestante = PROT_COOLDOWN - tick
+                    end
+                    protAguardandoCD = false
+                    protCDRestante   = 0
+                else
+                    -- dialog não apareceu → pequena pausa antes de tentar de novo
+                    sampAddChatMessage('[ShoxFarm] Dialog nao detectado, tentando novamente em 10s...', 0xFF6666)
+                    wait(10000)
+                end
+            end
+        end)
+    end
+
+    local function protDesligar()
+        if not protAtivo then return end
+        protAtivo        = false
+        chkProt.v        = false
+        protAguardandoCD = false
+        protCDRestante   = 0
+        sampAddChatMessage('[ShoxFarm] Auto Protecao DESATIVADO', 0xFF6666)
+    end
+
+    -- ===================================================================
     --  EVENTO: mensagem do servidor
     -- ===================================================================
     local function onServerMessage(color, text)
@@ -138,7 +214,21 @@ return function(ctx)
     end
 
     -- ===================================================================
-    --  GUI
+    --  EVENTO: dialog do servidor → clica botão 1 e sinaliza proteção
+    -- ===================================================================
+    function sampev.onShowDialog(dialogId, style, title, button1, button2, text)
+        if protAtivo then
+            -- clica no botão 1 (confirmar proteção)
+            lua_thread.create(function()
+                wait(150)
+                sampSendDialogResponse(dialogId, 1, -1, "")
+                protDialogRecebido = true
+            end)
+        end
+    end
+
+    -- ===================================================================
+    --  GUI — helpers de estilo
     -- ===================================================================
     local function pushChk()
         imgui.PushStyleColor(imgui.Col.CheckMark,      imgui.ImVec4(0.85, 0.10, 0.10, 1.00))
@@ -172,6 +262,9 @@ return function(ctx)
         imgui.PopStyleColor()
     end
 
+    -- ===================================================================
+    --  GUI — draw
+    -- ===================================================================
     local function drawGui(W)
         imgui.Dummy(imgui.ImVec2(0, 6))
 
@@ -220,14 +313,11 @@ return function(ctx)
         imgui.PopStyleColor()
         imgui.Dummy(imgui.ImVec2(0, 6))
 
-        -- Combo seletor
         pushCombo()
         imgui.SetCursorPosX(20)
         imgui.PushItemWidth(W - 40)
         if imgui.Combo("##drogasel", drogaSelImm, comboBuf) then
-            -- sincroniza índice Lua (1-based) a partir do ImInt (0-based)
             drogaSelIdx = drogaSelImm.v + 1
-            -- se estava ativo, reinicia com a nova droga
             if drogaAtiva then
                 drogaDesligar()
                 lua_thread.create(function()
@@ -241,7 +331,6 @@ return function(ctx)
 
         imgui.Dummy(imgui.ImVec2(0, 6))
 
-        -- Checkbox único
         pushChk()
         imgui.SetCursorPosX(20)
         if imgui.Checkbox("|   |Auto Droga", chkDroga) then
@@ -267,6 +356,63 @@ return function(ctx)
         imgui.PushStyleColor(imgui.Col.Text, corA)
         imgui.Text(string.format("Colete atual: %.0f / %d", armourAtual, ARMOUR_ALVO))
         imgui.PopStyleColor()
+
+        imgui.Dummy(imgui.ImVec2(0, 8))
+        imgui.SetCursorPosX(20)
+        imgui.Text("------------------------------------------------")
+        imgui.Dummy(imgui.ImVec2(0, 4))
+
+        -- ── Proteção ─────────────────────────────────────────────
+        imgui.SetCursorPosX(20)
+        imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.80, 0.80, 0.20, 1.00))
+        imgui.Text("[ Protecao — veiculo ou interior ]")
+        imgui.PopStyleColor()
+        imgui.Dummy(imgui.ImVec2(0, 6))
+
+        pushChk()
+        imgui.SetCursorPosX(20)
+        if imgui.Checkbox("|   |Auto Protecao", chkProt) then
+            if chkProt.v then protLigar() else protDesligar() end
+        end
+        popChk()
+        imgui.SameLine()
+        imgui.SetCursorPosX(W - 80)
+        statusTag(protAtivo)
+
+        imgui.Dummy(imgui.ImVec2(0, 4))
+        imgui.SetCursorPosX(20)
+        imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.55, 0.55, 0.55, 1.00))
+        imgui.Text("Cooldown: 5 min  |  Clica botao 1 automaticamente")
+        imgui.PopStyleColor()
+
+        -- barra de cooldown
+        if protAtivo and protAguardandoCD then
+            imgui.Dummy(imgui.ImVec2(0, 4))
+            imgui.SetCursorPosX(20)
+            local progresso = 1.0 - (protCDRestante / protCDTotal)
+            imgui.PushStyleColor(imgui.Col.PlotHistogram, imgui.ImVec4(0.00, 0.75, 0.40, 1.00))
+            imgui.PushStyleColor(imgui.Col.FrameBg,       imgui.ImVec4(0.12, 0.12, 0.12, 1.00))
+            imgui.PushItemWidth(W - 40)
+            imgui.ProgressBar(progresso, imgui.ImVec2(W - 40, 14), "")
+            imgui.PopItemWidth()
+            imgui.PopStyleColor(2)
+
+            imgui.SetCursorPosX(20)
+            local secsLeft = math.ceil(protCDRestante / 1000)
+            local mm = math.floor(secsLeft / 60)
+            local ss = secsLeft % 60
+            imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.65, 0.65, 0.65, 1.00))
+            imgui.Text(string.format("Proximo em: %02d:%02d", mm, ss))
+            imgui.PopStyleColor()
+        elseif protAtivo then
+            imgui.Dummy(imgui.ImVec2(0, 4))
+            imgui.SetCursorPosX(20)
+            imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(1.00, 0.80, 0.00, 1.00))
+            imgui.Text("Aguardando veiculo ou interior...")
+            imgui.PopStyleColor()
+        end
+
+        imgui.Dummy(imgui.ImVec2(0, 6))
     end
 
     -- ===================================================================
@@ -275,6 +421,6 @@ return function(ctx)
     return {
         drawGui         = drawGui,
         onServerMessage = onServerMessage,
-        isAtivo         = function() return cxAtivo or drogaAtiva end,
+        isAtivo         = function() return cxAtivo or drogaAtiva or protAtivo end,
     }
 end
