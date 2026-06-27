@@ -261,7 +261,7 @@ return function(ctx)
             sampAddChatMessage('[ShoxFarm] Dialog protecao detectado! Fechando...', 0x00FF88)
             lua_thread.create(function()
                 wait(150)
-                sampSendDialogResponse(dialogId, 0, -1, "")
+                sampSendDialogResponse(dialogId, 1, -1, "")
                 protDialogRecebido = true
             end)
         end
