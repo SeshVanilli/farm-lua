@@ -69,14 +69,17 @@ return function(ctx)
         { nome = "Maconha", cmd = "/usarmaconha" },
     }
 
-    -- Estado
+    -- índice selecionado como inteiro Lua simples (1-based)
+    local drogaSelIdx  = 1
+    -- ImInt só pra passar pro Combo do imgui (0-based)
+    local drogaSelImm  = imgui.ImInt(0)
+
     local drogaAtiva   = false
     local chkDroga     = imgui.ImBool(false)
-    local drogaSel     = imgui.ImInt(0)   -- índice 0-based do combo
     local ARMOUR_ALVO  = 200
     local CICLO_MS     = 15000
 
-    -- Monta array de nomes pra o combo (null-terminated)
+    -- string null-terminated pro Combo
     local comboBuf = ""
     for _, d in ipairs(DROGAS) do
         comboBuf = comboBuf .. d.nome .. "\0"
@@ -90,20 +93,19 @@ return function(ctx)
 
     local function drogaLigar()
         if drogaAtiva then return end
-        drogaAtiva    = true
-        chkDroga.v    = true
-        block_anims   = true   -- liga bloqueio imediatamente
+        drogaAtiva  = true
+        chkDroga.v  = true
+        block_anims = true
 
-        local idx  = drogaSel[0] + 1   -- converte pra 1-based
-        local nome = DROGAS[idx].nome
+        local nome = DROGAS[drogaSelIdx].nome
         sampAddChatMessage('[ShoxFarm] Auto' .. nome .. ' ATIVADO', 0x00FF88)
 
         lua_thread.create(function()
             while drogaAtiva do
-                local idx_cur = drogaSel[0] + 1
+                local cmd = DROGAS[drogaSelIdx].cmd
                 if getArmour() < ARMOUR_ALVO then
-                    sampSendChat(DROGAS[idx_cur].cmd)
-                    sampAddChatMessage('[ShoxFarm] ' .. DROGAS[idx_cur].cmd .. ' enviado!', 0xFFAA00)
+                    sampSendChat(cmd)
+                    sampAddChatMessage('[ShoxFarm] ' .. cmd .. ' enviado!', 0xFFAA00)
                     wait(CICLO_MS)
                 else
                     wait(1000)
@@ -115,11 +117,9 @@ return function(ctx)
 
     local function drogaDesligar()
         if not drogaAtiva then return end
-        drogaAtiva  = false
-        chkDroga.v  = false
-        local idx   = drogaSel[0] + 1
-        sampAddChatMessage('[ShoxFarm] Auto' .. DROGAS[idx].nome .. ' DESATIVADO', 0xFF6666)
-        -- block_anims desligado pela thread ao sair do while
+        drogaAtiva = false
+        chkDroga.v = false
+        sampAddChatMessage('[ShoxFarm] Auto' .. DROGAS[drogaSelIdx].nome .. ' DESATIVADO', 0xFF6666)
     end
 
     -- ===================================================================
@@ -220,12 +220,14 @@ return function(ctx)
         imgui.PopStyleColor()
         imgui.Dummy(imgui.ImVec2(0, 6))
 
-        -- Seletor de droga (combo)
+        -- Combo seletor
         pushCombo()
         imgui.SetCursorPosX(20)
         imgui.PushItemWidth(W - 40)
-        if imgui.Combo("##drogasel", drogaSel, comboBuf) then
-            -- se trocou enquanto ativo, reinicia com a nova droga
+        if imgui.Combo("##drogasel", drogaSelImm, comboBuf) then
+            -- sincroniza índice Lua (1-based) a partir do ImInt (0-based)
+            drogaSelIdx = drogaSelImm.v + 1
+            -- se estava ativo, reinicia com a nova droga
             if drogaAtiva then
                 drogaDesligar()
                 lua_thread.create(function()
