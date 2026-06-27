@@ -532,3 +532,4 @@ return function(ctx)
             if s.kit2     then kitLigar(2)     end
         end,
     }
+end
