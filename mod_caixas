@@ -378,6 +378,7 @@ local function load(ctx)
 
     disableMode = function(modo, motivo)
         local st = ST[modo]
+        local wasActive = st.active -- FIX 13: só loga se realmente estava rodando
         st.active          = false
         st.target          = nil
         st.caixa           = nil
@@ -385,7 +386,9 @@ local function load(ctx)
         st.recoveryCount   = 0
         st.actionsSinceBreather = 0
         st.caixaAbertaBusy = false
-        modeLog(modo, motivo or 'Desativado.')
+        if wasActive then
+            modeLog(modo, motivo or 'Desativado.')
+        end
     end
 
     performAction = function(modo, dialogId, response, listitem, label)
@@ -424,7 +427,13 @@ local function load(ctx)
                 return
             end
 
-            sampSetCurrentDialogListItem(listitem); wait(50)
+            -- FIX 12: listitem pode ser -1 nos casos de "Voltar/Cancelar"
+            -- (response=0). Chamar sampSetCurrentDialogListItem(-1) não
+            -- faz sentido e pode gerar comportamento indefinido nessa
+            -- API nativa — só seta o item quando ele é válido (>= 0).
+            if listitem >= 0 then
+                sampSetCurrentDialogListItem(listitem); wait(50)
+            end
             safeSendDialogResponse(dialogId, response, listitem, label)
             scheduleWatchdog(modo, myGen, dialogId, response, listitem, label)
         end)
@@ -448,7 +457,9 @@ local function load(ctx)
 
             st.pending.retries = st.pending.retries + 1
             if st.pending.retries <= CFG.maxRetries then
-                sampSetCurrentDialogListItem(listitem); wait(50)
+                if listitem >= 0 then -- FIX 12
+                    sampSetCurrentDialogListItem(listitem); wait(50)
+                end
                 safeSendDialogResponse(dialogId, response, listitem, label)
                 scheduleWatchdog(modo, myGen, dialogId, response, listitem, label)
             else
@@ -938,11 +949,19 @@ local function load(ctx)
         imgui.SetNextWindowPos(imgui.ImVec2(sw - 160, sh - 80), imgui.Cond.Always)
         imgui.SetNextWindowSize(imgui.ImVec2(150, 50), imgui.Cond.Always)
         imgui.PushStyleColor(imgui.Col.WindowBg, imgui.ImVec4(0, 0, 0, 0.65))
-        imgui.Begin("##hud_gen", nil,
-            imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize +
-            imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoCollapse +
-            imgui.WindowFlags.NoInputs + imgui.WindowFlags.NoNav +
-            imgui.WindowFlags.NoBringToFrontOnFocus)
+        -- FIX 11: imgui.WindowFlags.NoNav não existe nessa versão do
+        -- mimgui (o bind varia por versão do lib/imgui.lua) e causava
+        -- "attempt to perform arithmetic on field 'NoNav' (a nil value)",
+        -- derrubando o script inteiro no primeiro drawHud(). Trocado por
+        -- soma condicional: só usa a flag se ela existir de fato nessa
+        -- versão, então o HUD nunca mais quebra por causa disso.
+        local hudFlags = imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize +
+                         imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoCollapse +
+                         imgui.WindowFlags.NoInputs + imgui.WindowFlags.NoBringToFrontOnFocus
+        if imgui.WindowFlags.NoNav then
+            hudFlags = hudFlags + imgui.WindowFlags.NoNav
+        end
+        imgui.Begin("##hud_gen", nil, hudFlags)
         imgui.PushStyleColor(imgui.Col.Text, corContador(genCounter))
         imgui.Text("dialogs: " .. genCounter .. "/85")
         imgui.PopStyleColor()
