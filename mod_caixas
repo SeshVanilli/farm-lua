@@ -1,9 +1,118 @@
 -- ===================================================================
---  mod_caixas.lua  –  ShoxFarm módulo Juntar/Abrir Caixas
+--  mod_caixas.lua – ShoxFarm módulo Juntar/Abrir Caixas
 --  Recebe ctx (tabela compartilhada com U = mod_utils)
---  Retorna API pública: { enable, disable, isJuntando, isAbrindo,
---                         onShowDialog, onConnect, drawGuiJuntar,
---                         drawGuiAbrir, getGenCounter, corContador }
+--  Retorna API pública: { enableJuntar, enableAbrir, disable, onDisconnect,
+--                         isJuntando, isAbrindo, onShowDialog, onConnect,
+--                         drawGuiJuntar, drawGuiAbrir, getGenCounter,
+--                         corContador, getActionCount, getAbrirActionCount,
+--                         tryRestoreState, drawHud }
+-- ===================================================================
+--
+-- HISTÓRICO DE CORREÇÕES — comparado com AutoJuntarCaixas.lua (versão
+-- original/estável que você me mandou). Cada bloco abaixo tem uma nota
+-- "-- FIX N" no lugar exato onde o problema foi corrigido.
+--
+-- [FIX 1 - parseInventory quebrado]
+--   A versão anterior tentava extrair quantidade no formato "Nome (2)"
+--   com regex `'^(.-)%s+%((%d+)%)'`. O dialog de inventário real é
+--   TABULADO (nome<TAB>raridade), nunca tem "(N)" na linha. Resultado:
+--   `item.qty` sempre nil -> "juntar" nunca achava nada pra juntar e
+--   desistia na hora ("Nenhum item a juntar. Encerrando."), mesmo com
+--   stacks duplicadas na tela.
+--   -> Restaurado o algoritmo do original: conta quantas linhas têm o
+--   mesmo nome+raridade (parseInventoryRows + getJuntarTargets); quem
+--   aparece mais de uma vez é alvo de merge.
+--
+-- [FIX 2 - clique sempre no índice 0]
+--   handleItemMenu e handleMergeTarget clicavam sempre em
+--   `sampSetCurrentDialogListItem(0)`, sem ler o texto do dialog. Isso
+--   faz clicar na opção errada se a ordem do menu não for a esperada
+--   (ex.: "Cancelar" em vez de "Usar"), e faz o merge sempre cair na
+--   primeira stack da lista, não necessariamente a certa.
+--   -> Restaurado: handleItemMenu procura a palavra "Usar" (se estamos
+--   no meio de abrir uma caixa) ou "Juntar" (se estamos mesclando
+--   stacks) no texto do menu. handleMergeTarget procura a linha cujo
+--   nome bate com o item que está sendo juntado (guardado em
+--   `st.target`, ver FIX 2b abaixo).
+--
+-- [FIX 2b - não existia rastreamento de "o que estou juntando/abrindo"]
+--   Sem isso é impossível saber, no menu de ações ou na tela de destino
+--   do merge, qual item/caixa está em jogo. Adicionado `st.target`
+--   (item sendo mesclado) e `st.caixa` (caixa sendo aberta) por modo.
+--
+-- [FIX 3 - sistema de watchdog/retry/recuperação tinha sumido]
+--   CFG.watchdog, CFG.maxRetries, CFG.recoverDelay e CFG.maxRecoveries
+--   já existiam na CFG mas não eram usados em NENHUM lugar do código.
+--   Se o servidor não respondesse a um clique, o script travava ali:
+--   sem reenvio, sem recuperação, sem log de erro.
+--   -> Restaurado: toda ação vira um "pending" com watchdog
+--   (scheduleWatchdog). Se nenhum dialog novo aparecer em CFG.watchdog
+--   ms, reenvia a mesma resposta (até CFG.maxRetries vezes). Se mesmo
+--   assim não sair do lugar, chama recoverAndRetry(): ESC + reabre o
+--   inventário (até CFG.maxRecoveries vezes); se nem isso resolver,
+--   força reconexão/reinício do jogo — igual ao original.
+--
+-- [FIX 4 - contador de dialogs (dialogGen) não contava dialogs manuais]
+--   Antes, `if not modoAtivo then return false end` rodava ANTES de
+--   incrementar dialogGen, ou seja, dialogs abertos manualmente (sem
+--   automação ligada) não contavam pro limite anti-crash. O crash é do
+--   client nativo do jogo (documentado no original: acontece em
+--   gen=73/81/82/87), não da automação — então TODO dialog precisa
+--   contar, automático ou não.
+--   -> dialogGen agora incrementa no topo do onShowDialog, sempre.
+--
+-- [FIX 5 - reconexão preventiva só rodava dentro de handleBoxOpened]
+--   A checagem de CFG.limit (55 dialogs) só existia dentro de
+--   handleBoxOpened, ou seja, só disparava depois de abrir uma caixa.
+--   Se o contador passasse de 55 no meio de um ciclo de "juntar" (sem
+--   nenhuma caixa sendo aberta), a proteção nunca disparava.
+--   -> A checagem de CFG.limit roda agora em TODO onShowDialog, logo
+--   depois de contar o gen (igual ao forcarReconexaoPreventiva do
+--   original, que rodava no topo do sampev.onShowDialog).
+--
+-- [FIX 6 - configs mortas: maxActions e breather nunca eram usados]
+--   CFG.maxActions (trava contra loop infinito) e
+--   CFG.breatherEvery/breatherDuration (pausa periódica pra "respirar"
+--   o client — no original, confirmado por teste que reduz crash)
+--   estavam na CFG mas não apareciam em lugar nenhum do código.
+--   -> Ambos aplicados agora dentro de performAction().
+--
+-- [FIX 7 - matchItem ignorava a raridade]
+--   O parâmetro `rarity` de matchItem nunca era usado no corpo da
+--   função (só comparava nome). Agora só exige bater raridade quando
+--   ela está definida nos dois lados; senão compara só pelo nome (é o
+--   que CAIXAS_ABRIR = {"Caixa",""} / {"Pacote",""} precisa).
+--
+-- [FIX 8 - "Caixa Aberta" fechado do jeito errado]
+--   handleBoxOpened chamava `sampSendDialogResponse(dialogId, 1, 0, '')`
+--   pra fechar o popup de recompensa. O comentário do PRÓPRIO script
+--   original é explícito sobre isso (testado em produção): "para este
+--   dialog específico, sampSendDialogResponse NUNCA fecha o popup. Só
+--   o ESC de fato fecha." Ou seja, a versão mesclada reintroduziu um
+--   bug que já tinha sido corrigido e documentado antes.
+--   -> Restaurado: fecha com U.pressKeyEsc(), com espera ativa
+--   confirmando que o dialog realmente sumiu antes de reabrir o
+--   inventário; se não fechar em 2s, aciona recoverAndRetry().
+--
+-- [FIX 9 - juntar e abrir podiam rodar "ao mesmo tempo" e brigar pelo
+--   mesmo dialog]
+--   junt_mode e abrir_mode eram flags independentes: nada impedia
+--   ligar os dois ao mesmo tempo pela GUI. Só existe UM dialog de
+--   inventário na tela por vez — se os dois modos tentassem responder
+--   o mesmo dialogId, teríamos dois sampSendDialogResponse concorrentes
+--   pro mesmo dialog (exatamente o tipo de condição de corrida que gera
+--   os travamentos/crashes que esse script inteiro existe pra evitar).
+--   -> Ativar um modo agora desativa o outro automaticamente
+--   (mutuamente exclusivos, igual ao `mode` único do script original).
+--
+-- [FIX 10 - onDisconnect não existia neste módulo]
+--   O original pausa a automação assim que a conexão cai
+--   inesperadamente (sampev.onDisconnect). Esse módulo não expunha
+--   nada equivalente. Adicionado M.onDisconnect() — PRECISA ser chamado
+--   pelo script principal (ShoxFarm.lua) dentro do handler global de
+--   desconexão, ex.: `function onDisconnect() mod_caixas.onDisconnect() end`
+--   Se o ShoxFarm.lua já trata isso globalmente de outra forma, ignore
+--   este item, mas o método está disponível caso precise.
 -- ===================================================================
 
 local function load(ctx)
@@ -12,21 +121,21 @@ local function load(ctx)
 
     -- ==================== CONFIG ====================
     local CFG = {
-        limit               = 55,
+        limit               = 55,   -- FIX 5: gen a partir do qual reconecta preventivamente
         actionDelay         = 1000,
         openDelay           = 1000,
-        watchdog            = 3000,
-        maxRetries          = 4,
-        recoverDelay        = 1000,
-        maxRecoveries       = 8,
-        breatherEvery       = 15,
-        breatherDuration    = 4000,
+        watchdog            = 3000, -- FIX 3: tempo sem dialog novo = considerado travado
+        maxRetries          = 4,    -- FIX 3: reenvios antes de acionar recuperação
+        recoverDelay        = 1000, -- FIX 3: espera após ESC antes de reabrir o inventário
+        maxRecoveries       = 8,    -- FIX 3: recuperações seguidas antes de forçar reconexão
+        breatherEvery       = 15,   -- FIX 6: a cada N ações, força uma pausa
+        breatherDuration    = 4000, -- FIX 6
         tempoReconnect      = 5000,
         dialogCheckDelay    = 8000,
         restartDelay        = 3000,
         actionJitter        = 400,
         openJitter          = 400,
-        maxActions          = 4000,
+        maxActions          = 4000, -- FIX 6: trava de segurança contra loop infinito
         suppress            = true,
         hideDialogs         = false,
     }
@@ -44,31 +153,56 @@ local function load(ctx)
     }
 
     -- ==================== ESTADO ====================
-    local junt_mode      = nil
-    local abrir_mode     = nil
-    local junt_busy      = false
-    local actionCount    = 0
-    local abrir_actionCount = 0
-    local recoveryCount  = 0
-    local abrir_recoveryCount = 0
-    local actionsSinceBreather = 0
-    local abrir_actionsSinceBreather = 0
+    -- FIX 2b: cada modo tem seu próprio estado isolado (evita variáveis
+    -- soltas tipo currentTarget/caixaAbrindo compartilhadas incorretamente).
+    -- FIX 9: apesar de existir ST.juntar e ST.abrir separados, só um dos
+    -- dois pode estar `active = true` por vez (ver enableJuntar/enableAbrir).
+    local function newModeState()
+        return {
+            active               = false,
+            actionCount          = 0,
+            recoveryCount        = 0,   -- FIX 3
+            actionsSinceBreather = 0,   -- FIX 6
+            target               = nil, -- item sendo mesclado (duplicata) {name, rarity}
+            caixa                = nil, -- caixa sendo aberta (só no modo 'abrir') {name, rarity}
+            pending              = nil, -- FIX 3: {dialogId, response, listitem, gen, retries, label}
+            caixaAbertaBusy      = false, -- FIX 8: evita 2 threads simultâneas fechando "Caixa Aberta"
+        }
+    end
+
+    local ST = {
+        juntar = newModeState(),
+        abrir  = newModeState(),
+    }
+
+    -- Contador de dialogs é GLOBAL (não por modo): é uma característica
+    -- do client do jogo (risco de crash), não de cada automação (FIX 4/5).
     local dialogGen      = 0
     local genCounter     = 0
-    local dialogsSinceRest = 0
     local serverIp       = nil
     local serverPort     = nil
     local reconectandoEmergencia = false
     local reconectandoPreventivo = false
-    local modoAntesEmergencia    = nil
+    local modoAntesEmergencia    = { juntar = false, abrir = false }
     local emFlush        = false
 
     local checkReconectJuntar = imgui.ImBool(true)
     local checkReconectAbrir  = imgui.ImBool(true)
 
+    -- FIX 3: detecta se o SAMPFUNCS desta versão suporta checar se o
+    -- dialog atual ainda está de pé (evita clicar num dialog que o
+    -- client já destruiu internamente -> access violation).
+    local HAS_DIALOG_GUARD = (type(sampIsDialogActive) == 'function')
+                          and (type(sampGetCurrentDialogId) == 'function')
+
     -- ==================== HELPERS ====================
     local function junt_log(msg)  U.log('Juntar', msg, 0xFFAA00) end
     local function abrir_log(msg) U.log('Abrir',  msg, 0xFF5500) end
+    local function sysLog(msg)    U.log('Caixas', msg, 0xFFFFFF) end -- mensagens que não são de um modo específico (reconexão, restart)
+
+    local function modeLog(modo, msg)
+        if modo == 'abrir' then abrir_log(msg) else junt_log(msg) end
+    end
 
     local function corContador(count)
         if count < LIMITE_VERDE then
@@ -84,24 +218,31 @@ local function load(ctx)
         end
     end
 
-    local function saveState(modo, ip, port)
+    -- Salva a lista de modos ativos (normalmente só 1, ver FIX 9) para
+    -- retomar automaticamente depois de um restartGame().
+    local function saveState(modos, ip, port)
         local f = io.open(ESTADO_FILE, 'w')
-        if f then f:write(modo .. '\n' .. (ip or '') .. '\n' .. tostring(port or '')); f:close() end
+        if f then
+            f:write(table.concat(modos, ',') .. '\n' .. (ip or '') .. '\n' .. tostring(port or ''))
+            f:close()
+        end
     end
 
     local function loadState()
         local f = io.open(ESTADO_FILE, 'r')
         if not f then return nil end
-        local modo = f:read('*l'); local ip = f:read('*l'); local port = f:read('*l'); f:close()
-        if modo and modo ~= '' then
+        local modosStr = f:read('*l'); local ip = f:read('*l'); local port = f:read('*l'); f:close()
+        if modosStr and modosStr ~= '' then
             os.remove(ESTADO_FILE)
-            return modo, ip, (tonumber(port) or nil)
+            local modos = {}
+            for m in modosStr:gmatch('[^,]+') do table.insert(modos, m) end
+            return modos, ip, (tonumber(port) or nil)
         end
         return nil
     end
 
     local function restartGame()
-        junt_log('Reiniciando jogo...')
+        sysLog('Reiniciando jogo...')
         local si = ffi.new('STARTUPINFOA'); si.cb = ffi.sizeof(si)
         local pi = ffi.new('PROCESS_INFORMATION')
         local cmd = ffi.new('char[512]', GTA_EXE_PATH)
@@ -110,119 +251,474 @@ local function load(ctx)
         U.kernel32.ExitProcess(0)
     end
 
+    -- FIX 7: raridade só é exigida quando definida dos dois lados.
     local function matchItem(nome, rarity, lista)
         for _, v in ipairs(lista) do
-            if nome:find(v.name, 1, true) then return true end
+            local nameOk = (nome or ''):lower():find(v.name:lower(), 1, true) ~= nil
+            local rarityOk = true
+            if v.rarity and v.rarity ~= '' and rarity and rarity ~= '' then
+                rarityOk = rarity:lower() == v.rarity:lower()
+            end
+            if nameOk and rarityOk then return true end
         end
         return false
     end
 
-    local function parseInventory(text)
-        local items = {}
-        for linha in (text .. '\n'):gmatch('(.-)[\r\n]+') do
-            local nome, qty = linha:match('^(.-)%s+%((%d+)%)')
-            if not nome then nome = linha:match('^(.-)%s*$') end
-            local qtdN = tonumber(qty)
-            if nome and nome ~= '' then
-                table.insert(items, {name=nome, qty=qtdN})
+    -- ---------------------------------------------------------------
+    -- FIX 1: parsing do inventário restaurado igual ao original.
+    -- O dialog de inventário é TABULADO (colunas separadas por \t),
+    -- com uma linha de cabeçalho. Não existe "(quantidade)" na linha —
+    -- a "quantidade" de um item é simplesmente quantas linhas têm o
+    -- mesmo nome+raridade (ver getJuntarTargets).
+    -- ---------------------------------------------------------------
+    local function strip(s)
+        return (tostring(s):gsub('{%x%x%x%x%x%x}', '')) -- remove códigos de cor {RRGGBB}
+    end
+
+    local function trim(s)
+        return s:match('^%s*(.-)%s*$')
+    end
+
+    local function splitLines(text, hasHeader)
+        local lines = {}
+        for line in (text .. '\n'):gmatch('(.-)\n') do
+            table.insert(lines, trim(strip(line)))
+        end
+        if hasHeader and #lines > 0 then
+            table.remove(lines, 1)
+        end
+        return lines
+    end
+
+    local function splitCols(line)
+        local cols = {}
+        for col in (line .. '\t'):gmatch('(.-)\t') do
+            table.insert(cols, trim(col))
+        end
+        if #cols == 0 then cols[1] = line end
+        return cols
+    end
+
+    local function extractItemName(line)
+        local name = line:match('^.-%:%s*(.+)$')
+        return name and trim(name) or line
+    end
+
+    -- Retorna rows = { {name, rarity}, ... } na mesma ordem/índice que
+    -- o SAMP usa pro listitem (header já removido, 0-based = idx-1).
+    local function parseInventoryRows(text)
+        local lines = splitLines(text, true)
+        local rows = {}
+        for _, line in ipairs(lines) do
+            table.insert(rows, splitCols(line))
+        end
+        return rows
+    end
+
+    -- FIX 1: duplicata = mesmo nome+raridade aparecendo em mais de uma
+    -- linha da lista (é assim que o original detecta o que precisa ser
+    -- juntado, não por um número de quantidade escrito na linha).
+    local function getJuntarTargets(rows)
+        local count = {}
+        local order = {}
+        for _, row in ipairs(rows) do
+            local name   = row[1] or ''
+            local rarity = row[2] or ''
+            if name ~= '' then
+                local key = name .. '|' .. rarity
+                if not count[key] then
+                    count[key] = 0
+                    table.insert(order, {name = name, rarity = rarity ~= '' and rarity or nil, key = key})
+                end
+                count[key] = count[key] + 1
             end
         end
-        return items
-    end
-
-    -- forward ref
-    local openInventoryWatch
-
-    local function disable(motivo)
-        junt_mode = nil; abrir_mode = nil; junt_busy = false
-        junt_log(motivo or 'Desativado.')
-    end
-
-    local function flushEmergencia()
-        if emFlush then return true end
-        emFlush = true
-        junt_log('Limite critico (' .. dialogGen .. '/' .. LIMITE_CRITICO .. '). ESC flush...')
-        U.pressKeyEsc(); wait(150); U.pressKeyEsc(); wait(2000)
-        dialogGen = 0; genCounter = 0; emFlush = false
-        if junt_mode or abrir_mode then
-            lua_thread.create(function() wait(300); openInventoryWatch() end)
+        local targets = {}
+        for _, t in ipairs(order) do
+            if count[t.key] > 1 then
+                table.insert(targets, {name = t.name, rarity = t.rarity})
+            end
         end
+        return targets
+    end
+
+    -- ---------------------------------------------------------------
+    -- FIX 3: sistema de clique com watchdog + retry + recuperação.
+    -- Fluxo: performAction agenda o clique (com jitter e breather),
+    -- envia a resposta, e arma um watchdog. Se nenhum dialog novo
+    -- aparecer em CFG.watchdog ms, reenvia (até maxRetries vezes). Se
+    -- persistir travado, recoverAndRetry() faz ESC + reabre o
+    -- inventário; se isso também falhar maxRecoveries vezes seguidas,
+    -- força reconexão (e, se nem reconectar resolver, reinicia o jogo
+    -- via M.onConnect, igual ao fluxo de reconexão preventiva).
+    -- ---------------------------------------------------------------
+    local performAction
+    local scheduleWatchdog
+    local recoverAndRetry
+    local openInventoryWatch
+    local flushEmergencia
+    local forcarReconexaoPreventiva
+    local disableMode
+
+    local function isDialogStillActive(dialogId, myGen)
+        if dialogGen ~= myGen then return false end
+        if not HAS_DIALOG_GUARD then return true end -- sem a API, confia só no gen
+        if not sampIsDialogActive() then return false end
+        if sampGetCurrentDialogId() ~= dialogId then return false end
         return true
     end
 
-    local function handleInventoryList(dialogId, text, modoAtivo)
-        if modoAtivo == 'juntar' then
-            local items = parseInventory(text)
-            local alvo  = nil
-            for i, item in ipairs(items) do
-                if item.qty and item.qty >= 2 then alvo = {idx=i-1, item=item}; break end
-            end
-            if not alvo then
-                junt_log('Nenhum item a juntar. Encerrando.')
-                disable('Sem itens para juntar.'); U.pressKeyEsc(); return
-            end
-            wait(U.jitter(CFG.actionDelay, CFG.actionJitter))
-            sampSetCurrentDialogListItem(alvo.idx); wait(50)
-            sampSendDialogResponse(dialogId, 1, alvo.idx, '')
-            actionCount = actionCount + 1; genCounter = dialogGen; alvo = nil
-
-        elseif modoAtivo == 'abrir' then
-            local items = parseInventory(text)
-            local alvo  = nil
-            for i, item in ipairs(items) do
-                if matchItem(item.name, item.rarity or '', CAIXAS_ABRIR) then
-                    alvo = {idx=i-1, item=item}; break
-                end
-            end
-            if not alvo then
-                abrir_log('Nenhuma caixa no inventario. Encerrando.')
-                disable('Sem caixas para abrir.'); U.pressKeyEsc(); return
-            end
-            wait(U.jitter(CFG.actionDelay, CFG.actionJitter))
-            sampSetCurrentDialogListItem(alvo.idx); wait(50)
-            sampSendDialogResponse(dialogId, 1, alvo.idx, '')
-            actionCount = actionCount + 1; abrir_actionCount = abrir_actionCount + 1
-            genCounter = dialogGen; alvo = nil
+    local function safeSendDialogResponse(dialogId, response, listitem, label)
+        local ok, err = pcall(sampSendDialogResponse, dialogId, response, listitem, '')
+        if not ok then
+            sysLog(('[%s] erro ao enviar resposta (dialog=%d): %s'):format(label or '?', dialogId, tostring(err)))
         end
+        return ok
     end
 
-    local function handleItemMenu(dialogId, text, modoAtivo)
-        wait(U.jitter(CFG.actionDelay, CFG.actionJitter))
-        sampSetCurrentDialogListItem(0); wait(50)
-        sampSendDialogResponse(dialogId, 1, 0, '')
+    disableMode = function(modo, motivo)
+        local st = ST[modo]
+        st.active          = false
+        st.target          = nil
+        st.caixa           = nil
+        st.pending         = nil
+        st.recoveryCount   = 0
+        st.actionsSinceBreather = 0
+        st.caixaAbertaBusy = false
+        modeLog(modo, motivo or 'Desativado.')
     end
 
-    local function handleMergeTarget(dialogId, text)
-        wait(U.jitter(CFG.actionDelay, CFG.actionJitter))
-        sampSetCurrentDialogListItem(0); wait(50)
-        sampSendDialogResponse(dialogId, 1, 0, '')
-    end
+    performAction = function(modo, dialogId, response, listitem, label)
+        local st = ST[modo]
 
-    local function handleBoxOpened(dialogId, modoAtivo)
-        wait(U.jitter(CFG.openDelay, CFG.openJitter))
-        sampSendDialogResponse(dialogId, 1, 0, '')
-        if (checkReconectJuntar.v or checkReconectAbrir.v) and dialogGen >= CFG.limit then
-            junt_log('Limite de dialogs atingido (' .. dialogGen .. '). Reconectando...')
-            reconectandoEmergencia = true; modoAntesEmergencia = modoAtivo
-            wait(500); disable('Reconectando preventivamente...')
-            wait(CFG.tempoReconnect)
-            if serverIp and serverPort then sampConnectToServer(serverIp, serverPort) end
+        st.actionCount = st.actionCount + 1
+        if st.actionCount > CFG.maxActions then -- FIX 6
+            disableMode(modo, 'Limite de acoes atingido.')
             return
         end
+
+        local myGen = dialogGen
+        st.pending = { dialogId = dialogId, response = response, listitem = listitem,
+                       gen = myGen, retries = 0, label = label or '?' }
+
+        -- FIX 6: pausa periódica pra "respirar" o client entre ciclos.
+        st.actionsSinceBreather = st.actionsSinceBreather + 1
+        local needsBreather = st.actionsSinceBreather >= CFG.breatherEvery
+        if needsBreather then st.actionsSinceBreather = 0 end
+
         lua_thread.create(function()
-            wait(U.jitter(CFG.openDelay, CFG.openJitter))
-            if junt_mode or abrir_mode then U.pressKeyN() end
+            if needsBreather then
+                modeLog(modo, ('Pausa de %dms a cada %d acoes (respiro do client)...'):format(CFG.breatherDuration, CFG.breatherEvery))
+                wait(CFG.breatherDuration)
+                if dialogGen ~= myGen then
+                    if st.pending and st.pending.gen == myGen then st.pending = nil end
+                    return
+                end
+            end
+
+            wait(U.jitter(CFG.actionDelay, CFG.actionJitter))
+            if not isDialogStillActive(dialogId, myGen) then
+                -- Dialog já mudou ou fechou sem ser substituído: NUNCA
+                -- mandar sampSendDialogResponse aqui, é isso que gera AV.
+                if st.pending and st.pending.gen == myGen then st.pending = nil end
+                return
+            end
+
+            sampSetCurrentDialogListItem(listitem); wait(50)
+            safeSendDialogResponse(dialogId, response, listitem, label)
+            scheduleWatchdog(modo, myGen, dialogId, response, listitem, label)
         end)
     end
 
-    openInventoryWatch = function()
+    scheduleWatchdog = function(modo, myGen, dialogId, response, listitem, label)
+        lua_thread.create(function()
+            wait(CFG.watchdog)
+            local st = ST[modo]
+            if not st.active then return end
+            if dialogGen ~= myGen then return end               -- um dialog novo apareceu: sucesso
+            if not st.pending or st.pending.gen ~= myGen then return end
+
+            if not isDialogStillActive(dialogId, myGen) then
+                -- O dialog sumiu sem ser substituído (timeout do servidor,
+                -- fechado externamente etc). Reenviar aqui é o caminho
+                -- direto pro crash: só resta recuperar.
+                recoverAndRetry(modo)
+                return
+            end
+
+            st.pending.retries = st.pending.retries + 1
+            if st.pending.retries <= CFG.maxRetries then
+                sampSetCurrentDialogListItem(listitem); wait(50)
+                safeSendDialogResponse(dialogId, response, listitem, label)
+                scheduleWatchdog(modo, myGen, dialogId, response, listitem, label)
+            else
+                recoverAndRetry(modo)
+            end
+        end)
+    end
+
+    recoverAndRetry = function(modo)
+        local st = ST[modo]
+        st.recoveryCount = st.recoveryCount + 1
+
+        if st.recoveryCount > CFG.maxRecoveries then
+            -- Esgotou as tentativas de ESC+reabrir: força a mesma
+            -- reconexão que o CFG.limit já usa. Se nem reconectar
+            -- resolver, M.onConnect reinicia o jogo (ver mais abaixo).
+            sysLog(('[%s] travou %d vezes seguidas. Forcando reconexao...'):format(modo, CFG.maxRecoveries))
+            modoAntesEmergencia[modo] = true
+            reconectandoEmergencia = true
+            disableMode(modo, 'Automacao pausada para reconexao de emergencia.')
+            lua_thread.create(function()
+                wait(500)
+                if type(sampDisconnectWithReason) == 'function' then
+                    sampDisconnectWithReason(0)
+                elseif serverIp and serverPort then
+                    wait(CFG.tempoReconnect)
+                    sampConnectToServer(serverIp, serverPort)
+                end
+            end)
+            return
+        end
+
+        st.pending = nil
+        st.target  = nil
+        st.caixa   = nil
+        modeLog(modo, ('Travou! Recuperando (%d/%d)...'):format(st.recoveryCount, CFG.maxRecoveries))
+
+        lua_thread.create(function()
+            -- Só dá ESC se realmente existir dialog aberto (ESC "no
+            -- vazio" abre o menu de pausa do jogo).
+            if not HAS_DIALOG_GUARD or sampIsDialogActive() then
+                U.pressKeyEsc()
+            end
+            wait(CFG.recoverDelay)
+            if st.active then
+                openInventoryWatch(modo)
+            end
+        end)
+    end
+
+    -- Abre o inventário e confirma (via watchdog próprio) que abriu de
+    -- verdade; se não abrir em CFG.watchdog ms, tenta de novo.
+    openInventoryWatch = function(modo)
+        local st = ST[modo]
         local genAntes = dialogGen
         U.pressKeyN()
         lua_thread.create(function()
             wait(CFG.watchdog + 500)
-            if dialogGen == genAntes and (junt_mode or abrir_mode) then
-                junt_log('Inventario nao abriu. Tentando novamente...')
-                lua_thread.create(function() wait(500); openInventoryWatch() end)
+            if dialogGen == genAntes and st.active then
+                if HAS_DIALOG_GUARD and sampIsDialogActive() then return end -- já tem dialog, não manda outro N
+                modeLog(modo, 'Inventario nao abriu. Tentando novamente...')
+                lua_thread.create(function() wait(500); openInventoryWatch(modo) end)
+            end
+        end)
+    end
+
+    -- ---------------------------------------------------------------
+    -- Flush de emergência (LIMITE_CRITICO = 85): fallback caso a
+    -- reconexão preventiva (CFG.limit = 55) esteja desligada nos
+    -- checkboxes. Só dá ESC duas vezes e zera o contador; não
+    -- desconecta. Continua existindo tal como estava, só que agora é
+    -- alcançável de fato porque o gen conta corretamente (FIX 4).
+    -- ---------------------------------------------------------------
+    flushEmergencia = function()
+        if emFlush then return true end
+        emFlush = true
+        sysLog('Limite critico (' .. dialogGen .. '/' .. LIMITE_CRITICO .. '). ESC flush...')
+        U.pressKeyEsc(); wait(150); U.pressKeyEsc(); wait(2000)
+        dialogGen = 0; genCounter = 0; emFlush = false
+        if ST.juntar.active then lua_thread.create(function() wait(300); openInventoryWatch('juntar') end) end
+        if ST.abrir.active  then lua_thread.create(function() wait(300); openInventoryWatch('abrir')  end) end
+        return true
+    end
+
+    -- FIX 5: reconexão preventiva por contagem de dialogs, agora
+    -- chamada direto do topo do onShowDialog (não mais só dentro de
+    -- handleBoxOpened), então dispara não importa em que ponto do
+    -- ciclo o limite for atingido.
+    forcarReconexaoPreventiva = function()
+        if reconectandoPreventivo then return end
+        reconectandoPreventivo = true
+
+        if not serverIp or not serverPort then
+            local ok, ip, port = pcall(sampGetServerInfo)
+            if ok and ip and port then serverIp, serverPort = ip, port end
+        end
+
+        modoAntesEmergencia.juntar = ST.juntar.active
+        modoAntesEmergencia.abrir  = ST.abrir.active
+        reconectandoEmergencia = true
+        sysLog('Limite de ' .. CFG.limit .. ' dialogs atingido (gen=' .. dialogGen .. ') - reconectando preventivamente...')
+
+        disableMode('juntar', 'Reconexao preventiva em andamento...')
+        disableMode('abrir',  'Reconexao preventiva em andamento...')
+
+        lua_thread.create(function()
+            if HAS_DIALOG_GUARD and sampIsDialogActive() then
+                U.pressKeyEsc()
+                local waited = 0
+                while waited < 1500 do
+                    wait(100); waited = waited + 100
+                    if not sampIsDialogActive() then break end
+                end
+            end
+            wait(300)
+            if type(sampDisconnectWithReason) == 'function' then
+                sampDisconnectWithReason(0)
+            end
+        end)
+    end
+
+    -- ================================================================
+    -- DIALOG 1: Inventario de <nome>, Itens: N/M
+    -- ================================================================
+    local function handleInventoryList(dialogId, text, modo)
+        local st = ST[modo]
+        st.recoveryCount = 0 -- chegou um dialog válido: fluxo está vivo
+
+        local rows = parseInventoryRows(text) -- FIX 1
+
+        -- PRIORIDADE 1: junta qualquer duplicata existente agora, vale
+        -- pros dois modos (evita o inventário lotar de stacks soltos
+        -- entre uma caixa aberta e outra).
+        local targets = getJuntarTargets(rows) -- FIX 1
+        for _, target in ipairs(targets) do
+            local matches = {}
+            for idx, row in ipairs(rows) do
+                local name     = (row[1] or ''):lower()
+                local rarity   = (row[2] or ''):lower()
+                local nameOk   = name == target.name:lower()
+                local rarityOk = (target.rarity == nil) or (rarity == target.rarity:lower())
+                if nameOk and rarityOk then table.insert(matches, idx - 1) end
+            end
+            if #matches > 1 then
+                st.target = target -- FIX 2b: guarda o alvo pra handleMergeTarget usar depois
+                st.caixa  = nil    -- deixa explícito: isso é MERGE, não abertura
+                modeLog(modo, ("Juntando '%s' (%d stacks)..."):format(target.name, #matches))
+                performAction(modo, dialogId, 1, matches[1], 'Selecionar item p/ juntar')
+                return
+            end
+        end
+
+        -- PRIORIDADE 2: sem nada pra juntar -> abre a próxima caixa (só modo 'abrir')
+        if modo == 'abrir' then
+            for _, caixa in ipairs(CAIXAS_ABRIR) do
+                for idx, row in ipairs(rows) do
+                    if matchItem(row[1] or '', row[2] or '', {caixa}) then
+                        st.caixa  = caixa
+                        st.target = nil
+                        abrir_log(("Abrindo '%s' (idx=%d)..."):format(row[1], idx - 1))
+                        performAction(modo, dialogId, 1, idx - 1, 'Selecionar caixa')
+                        return
+                    end
+                end
+            end
+            disableMode('abrir', 'Tudo pronto! Caixas abertas e itens juntados.')
+            U.pressKeyEsc()
+            return
+        end
+
+        -- modo 'juntar': não há mais nada pra fazer
+        disableMode('juntar', 'Inventario limpo! Apenas 1 stack de cada item.')
+        U.pressKeyEsc()
+    end
+
+    -- ================================================================
+    -- DIALOG 2: Item Selecionado: <nome> (Quantia: N) — menu de ações
+    -- ================================================================
+    local function handleItemMenu(dialogId, text, modo)
+        local st = ST[modo]
+        local lines = splitLines(text, false)
+
+        -- FIX 2: no meio de abrir uma caixa específica -> clica "Usar"
+        if st.caixa then
+            for idx, line in ipairs(lines) do
+                if line:find('Usar', 1, true) then
+                    performAction(modo, dialogId, 1, idx - 1, 'Usar Item')
+                    return
+                end
+            end
+            performAction(modo, dialogId, 0, -1, 'Voltar (Usar nao encontrado)')
+            return
+        end
+
+        -- FIX 2: caso contrário, estamos juntando stacks -> clica "Juntar"
+        for idx, line in ipairs(lines) do
+            if line:find('Juntar', 1, true) then
+                performAction(modo, dialogId, 1, idx - 1, 'Juntar Item')
+                return
+            end
+        end
+
+        performAction(modo, dialogId, 0, -1, 'Voltar (Juntar nao encontrado)')
+    end
+
+    -- ================================================================
+    -- DIALOG 3: Item Selecionado <nome> (sem ":") — escolha do destino do merge
+    -- ================================================================
+    local function handleMergeTarget(dialogId, text, modo)
+        local st = ST[modo]
+        local lines = splitLines(text, true)
+
+        if not st.target then
+            performAction(modo, dialogId, 1, 0, 'Destino merge (sem target)')
+            return
+        end
+
+        -- FIX 2: procura a linha cujo nome bate com o item-alvo, em vez
+        -- de clicar sempre no índice 0.
+        for idx, line in ipairs(lines) do
+            local cols     = splitCols(line)
+            local itemName = extractItemName(cols[1] or '')
+            if itemName:lower() == st.target.name:lower() then
+                performAction(modo, dialogId, 1, idx - 1, 'Destino merge')
+                return
+            end
+        end
+
+        if #lines > 0 then
+            performAction(modo, dialogId, 1, 0, 'Destino merge (fallback)')
+        else
+            disableMode(modo, 'Lista de destino vazia.')
+        end
+    end
+
+    -- ================================================================
+    -- DIALOG 4: "Caixa Aberta" / "Item Obtido" — popup de recompensa
+    -- ================================================================
+    local function handleBoxOpened(dialogId, modo)
+        local st = ST[modo]
+        if st.caixaAbertaBusy then return end -- evita 2 threads concorrentes
+        st.caixaAbertaBusy = true
+        st.caixa = nil
+
+        local myGen = dialogGen
+        lua_thread.create(function()
+            wait(U.jitter(CFG.actionDelay, CFG.actionJitter))
+            if dialogGen ~= myGen then st.caixaAbertaBusy = false; return end
+
+            -- FIX 8: sampSendDialogResponse NUNCA fecha este popup
+            -- especificamente (confirmado e documentado no script
+            -- original). Só o ESC fecha de fato.
+            U.pressKeyEsc()
+
+            local waited = 0
+            while waited < 2000 do
+                wait(100); waited = waited + 100
+                if not HAS_DIALOG_GUARD or not sampIsDialogActive() then break end
+            end
+
+            if HAS_DIALOG_GUARD and sampIsDialogActive() then
+                st.caixaAbertaBusy = false
+                recoverAndRetry(modo) -- ESC não fechou: aciona recuperação
+                return
+            end
+
+            wait(U.jitter(CFG.openDelay, CFG.openJitter))
+            st.caixaAbertaBusy = false
+            if modo == 'abrir' and st.active then
+                openInventoryWatch(modo)
             end
         end)
     end
@@ -230,86 +726,96 @@ local function load(ctx)
     -- ==================== API PÚBLICA ====================
     local M = {}
 
+    -- FIX 9: juntar e abrir são mutuamente exclusivos — ligar um
+    -- desliga o outro, pra nunca ter dois handlers respondendo o
+    -- mesmo dialogId ao mesmo tempo.
     function M.enableJuntar()
-        junt_mode = 'juntar'; junt_busy = false
-        actionCount = 0; recoveryCount = 0; actionsSinceBreather = 0; dialogsSinceRest = 0
+        if ST.abrir.active then disableMode('abrir', 'Trocando para modo Juntar.') end
+        ST.juntar = newModeState()
+        ST.juntar.active = true
         dialogGen = 0; genCounter = 0
         junt_log('Modo JUNTAR ativado!')
-        lua_thread.create(function() wait(800); openInventoryWatch() end)
+        lua_thread.create(function() wait(800); openInventoryWatch('juntar') end)
     end
 
     function M.enableAbrir()
-        abrir_mode = 'abrir'; junt_busy = false
-        actionCount = 0; abrir_actionCount = 0; recoveryCount = 0
-        abrir_recoveryCount = 0; abrir_actionsSinceBreather = 0; dialogsSinceRest = 0
+        if ST.juntar.active then disableMode('juntar', 'Trocando para modo Abrir.') end
+        ST.abrir = newModeState()
+        ST.abrir.active = true
         dialogGen = 0; genCounter = 0
         abrir_log('Modo ABRIR ativado!')
-        lua_thread.create(function() wait(800); openInventoryWatch() end)
+        lua_thread.create(function() wait(800); openInventoryWatch('abrir') end)
     end
 
-    function M.disable(motivo) disable(motivo) end
-    function M.isJuntando() return junt_mode ~= nil end
-    function M.isAbrindo() return abrir_mode ~= nil end
+    -- Mantido com a mesma assinatura pública de antes (motivo, sem
+    -- modo): desativa os dois, pra não quebrar quem já chama
+    -- mod_caixas.disable(motivo) de fora.
+    function M.disable(motivo)
+        disableMode('juntar', motivo)
+        disableMode('abrir', motivo)
+    end
+
+    function M.isJuntando() return ST.juntar.active end
+    function M.isAbrindo()  return ST.abrir.active end
     function M.getGenCounter() return genCounter end
     function M.corContador(c) return corContador(c) end
-    function M.getActionCount() return actionCount end
-    function M.getAbrirActionCount() return abrir_actionCount end
+    function M.getActionCount() return ST.juntar.actionCount end
+    function M.getAbrirActionCount() return ST.abrir.actionCount end
 
     function M.tryRestoreState()
-        local savedMode, savedIp, savedPort = loadState()
-        if savedMode then
-            junt_log('Estado restaurado apos restart: modo=' .. savedMode)
-            modoAntesEmergencia    = savedMode
+        local savedModos, savedIp, savedPort = loadState()
+        if savedModos then
+            sysLog('Estado restaurado apos restart: modos=' .. table.concat(savedModos, ','))
+            modoAntesEmergencia.juntar = false
+            modoAntesEmergencia.abrir  = false
+            for _, m in ipairs(savedModos) do modoAntesEmergencia[m] = true end
             reconectandoEmergencia = true
-            if savedIp and savedPort then
-                serverIp = savedIp; serverPort = savedPort
-            end
+            if savedIp and savedPort then serverIp = savedIp; serverPort = savedPort end
         end
     end
 
-    -- Retorna true se suprimiu o dialog
+    -- Retorna true se suprimiu o dialog (não deixa renderizar)
     function M.onShowDialog(dialogId, style, tituloLimpo, textoDialog)
-        local modoAtivo = junt_mode or abrir_mode
-        if not modoAtivo then return false end
-
-        dialogGen  = dialogGen + 1
+        dialogGen  = dialogGen + 1 -- FIX 4: conta TODO dialog, com ou sem automacao ativa
         genCounter = dialogGen
 
-        if dialogGen >= LIMITE_CRITICO then
-            lua_thread.create(flushEmergencia); return true
+        -- FIX 9: só um modo ativo por vez.
+        local modoAtivo = ST.juntar.active and 'juntar' or (ST.abrir.active and 'abrir' or nil)
+
+        -- FIX 5: checagem de reconexão preventiva roda pra qualquer
+        -- dialog, não só os que aparecem depois de abrir uma caixa.
+        if CFG.limit > 0 and dialogGen >= CFG.limit
+           and (checkReconectJuntar.v or checkReconectAbrir.v)
+           and not reconectandoPreventivo then
+            forcarReconexaoPreventiva()
+            return modoAtivo ~= nil
         end
 
+        if dialogGen >= LIMITE_CRITICO then
+            lua_thread.create(flushEmergencia)
+            return modoAtivo ~= nil
+        end
+
+        if not modoAtivo then return false end
+
         if tituloLimpo:find('Inventario', 1, true) or tituloLimpo == '' then
-            lua_thread.create(function()
-                wait(U.jitter(CFG.actionDelay, CFG.actionJitter))
-                handleInventoryList(dialogId, textoDialog, modoAtivo)
-            end)
-            if CFG.hideDialogs then return true end
-            return false
+            handleInventoryList(dialogId, textoDialog, modoAtivo)
+            return CFG.hideDialogs
         end
 
         if tituloLimpo:find('Item Selecionado:', 1, true) then
-            lua_thread.create(function()
-                wait(U.jitter(CFG.actionDelay, CFG.actionJitter))
-                handleItemMenu(dialogId, textoDialog, modoAtivo)
-            end)
-            if CFG.suppress then return true end
-            return false
+            handleItemMenu(dialogId, textoDialog, modoAtivo)
+            return CFG.suppress
         end
 
         if tituloLimpo:find('Item Selecionado', 1, true) then
-            lua_thread.create(function()
-                wait(U.jitter(CFG.actionDelay, CFG.actionJitter))
-                handleMergeTarget(dialogId, textoDialog)
-            end)
-            if CFG.hideDialogs then return true end
-            return false
+            handleMergeTarget(dialogId, textoDialog, modoAtivo)
+            return CFG.hideDialogs
         end
 
         if tituloLimpo:find('Caixa Aberta', 1, true) or tituloLimpo:find('Item Obtido', 1, true) then
-            lua_thread.create(function() handleBoxOpened(dialogId, modoAtivo) end)
-            if CFG.suppress then return true end
-            return false
+            handleBoxOpened(dialogId, modoAtivo)
+            return CFG.suppress
         end
 
         return false
@@ -317,32 +823,47 @@ local function load(ctx)
 
     function M.onConnect(ip, port)
         serverIp = ip; serverPort = port
-        dialogGen = 0; reconectandoPreventivo = false
+        dialogGen = 0; genCounter = 0
+        reconectandoPreventivo = false
 
         if reconectandoEmergencia then
             reconectandoEmergencia = false
-            local savedMode = modoAntesEmergencia; modoAntesEmergencia = nil
-            junt_log('Reconectado! Testando dialogs em ' .. (CFG.dialogCheckDelay/1000) .. 's...')
+            local wasJuntar = modoAntesEmergencia.juntar
+            local wasAbrir  = modoAntesEmergencia.abrir
+            modoAntesEmergencia.juntar = false
+            modoAntesEmergencia.abrir  = false
+
+            sysLog('Reconectado! Testando dialogs em ' .. (CFG.dialogCheckDelay/1000) .. 's...')
             lua_thread.create(function()
                 wait(CFG.dialogCheckDelay)
                 local genAntes = dialogGen
                 U.pressKeyN(); wait(CFG.watchdog + 500)
                 if dialogGen ~= genAntes then
-                    junt_log('Dialogs OK! Retomando modo ' .. tostring(savedMode) .. '...')
+                    sysLog('Dialogs OK! Retomando automacao...')
                     U.pressKeyEsc(); wait(600)
-                    if savedMode == 'juntar' then
-                        M.enableJuntar()
-                    elseif savedMode == 'abrir' then
-                        M.enableAbrir()
-                    end
+                    if wasJuntar then M.enableJuntar()
+                    elseif wasAbrir then M.enableAbrir() end
                 else
-                    junt_log('Dialogs travados. Reiniciando jogo...')
-                    if savedMode and serverIp and serverPort then
-                        saveState(savedMode, serverIp, tostring(serverPort))
+                    sysLog('Dialogs travados. Reiniciando jogo...')
+                    local modos = {}
+                    if wasJuntar then table.insert(modos, 'juntar') end
+                    if wasAbrir  then table.insert(modos, 'abrir')  end
+                    if #modos > 0 and serverIp and serverPort then
+                        saveState(modos, serverIp, tostring(serverPort))
                     end
                     wait(CFG.restartDelay); restartGame()
                 end
             end)
+        end
+    end
+
+    -- FIX 10: não existia. Chame isto do handler global de desconexão
+    -- do ShoxFarm.lua, se ele ainda não pausar a automação sozinho.
+    function M.onDisconnect()
+        if ST.juntar.active or ST.abrir.active then
+            modoAntesEmergencia.juntar = false
+            modoAntesEmergencia.abrir  = false
+            M.disable('Conexao perdida - automacao pausada, reconectando...')
         end
     end
 
@@ -352,11 +873,11 @@ local function load(ctx)
         U.warnText("AVISO 2: Flush automatico (ESC) ao chegar em 85 dialogs.")
         imgui.Text("------------------------------------------------")
         imgui.SetCursorPosX(20)
-        imgui.Checkbox("Desconectar preventivamente ao atingir 79 dialogs", checkReconectJuntar)
+        imgui.Checkbox("Desconectar preventivamente ao atingir 55 dialogs", checkReconectJuntar)
         imgui.Text("")
-        if junt_mode then
+        if ST.juntar.active then
             imgui.SetCursorPosX(20)
-            imgui.Text("Acoes: " .. actionCount)
+            imgui.Text("Acoes: " .. ST.juntar.actionCount)
             imgui.SetCursorPosX(20)
             imgui.Text("Dialogs: ")
             imgui.SameLine()
@@ -367,9 +888,9 @@ local function load(ctx)
         imgui.Text("")
         local bw = W - 40; local bh = 44
         imgui.SetCursorPosX(20)
-        if junt_mode then
+        if ST.juntar.active then
             if U.colorBtn("  PARAR DE JUNTAR  ", bw, bh, 0.08,0.55,0.15, 0.10,0.70,0.20) then
-                M.disable("Parado pela GUI."); U.pressKeyEsc()
+                disableMode('juntar', "Parado pela GUI."); U.pressKeyEsc()
             end
         else
             if U.colorBtn("  JUNTAR CAIXAS  ", bw, bh, 0.65,0.05,0.05, 0.80,0.10,0.10) then
@@ -384,11 +905,11 @@ local function load(ctx)
         U.warnText("AVISO 2: Flush automatico (ESC) ao chegar em 85 dialogs.")
         imgui.Text("------------------------------------------------")
         imgui.SetCursorPosX(20)
-        imgui.Checkbox("Desconectar preventivamente ao atingir 79 dialogs", checkReconectAbrir)
+        imgui.Checkbox("Desconectar preventivamente ao atingir 55 dialogs", checkReconectAbrir)
         imgui.Text("")
-        if abrir_mode then
+        if ST.abrir.active then
             imgui.SetCursorPosX(20)
-            imgui.Text("Acoes: " .. abrir_actionCount)
+            imgui.Text("Acoes: " .. ST.abrir.actionCount)
             imgui.SetCursorPosX(20)
             imgui.Text("Dialogs: ")
             imgui.SameLine()
@@ -399,9 +920,9 @@ local function load(ctx)
         imgui.Text("")
         local bw = W - 40; local bh = 44
         imgui.SetCursorPosX(20)
-        if abrir_mode then
+        if ST.abrir.active then
             if U.colorBtn("  PARAR DE ABRIR  ", bw, bh, 0.08,0.55,0.15, 0.10,0.70,0.20) then
-                abrir_mode = nil; M.disable("Parado pela GUI."); U.pressKeyEsc()
+                disableMode('abrir', "Parado pela GUI."); U.pressKeyEsc()
             end
         else
             if U.colorBtn("  ABRIR CAIXAS  ", bw, bh, 0.65,0.05,0.05, 0.80,0.10,0.10) then
@@ -412,7 +933,7 @@ local function load(ctx)
 
     -- HUD overlay (chamado no final do OnDrawFrame)
     function M.drawHud()
-        if junt_mode == nil and abrir_mode == nil then return end
+        if not ST.juntar.active and not ST.abrir.active then return end
         local sw, sh = getScreenResolution()
         imgui.SetNextWindowPos(imgui.ImVec2(sw - 160, sh - 80), imgui.Cond.Always)
         imgui.SetNextWindowSize(imgui.ImVec2(150, 50), imgui.Cond.Always)
