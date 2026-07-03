@@ -184,6 +184,22 @@ local function load(ctx)
             pcall(sampSendDialogResponse, dialogId, 1, 0, '')
             return true
         end
+
+        -- FOLGA INICIAL (mesma razao da aguardarTituloEAgir, correcao
+        -- v2.2 do script original): o onShowDialog dispara de forma
+        -- sincrona no instante em que o CLIENT recebe o dialog, mas
+        -- sampIsDialogActive/sampGetCurrentDialogId (SAMPFUNCS, estado
+        -- interno do CDialog do jogo) podem levar uma fracao de segundo
+        -- a mais pra refletir esse dialog como "ativo". Sem essa folga,
+        -- a PRIMEIRA dialogAindaAtivo() logo abaixo corre na mesma
+        -- sincronia do evento, ve o dialog como "ainda nao ativo" e
+        -- fecharComCerteza desiste na hora (return true, achando que ja
+        -- fechou sozinho) sem nunca mandar o ENTER -- foi exatamente
+        -- isso que travou o dialog "Proposta Cancelada" na tela: ele
+        -- continuava genuinamente aberto, so a leitura do estado interno
+        -- que ainda nao tinha assentado.
+        wait(DELAY_PADRAO)
+
         for tentativa = 1, maxTentativas do
             if not rodando then return true end
             if not dialogAindaAtivo(dialogId, meuGen) then return true end
