@@ -97,6 +97,7 @@ local function load(ctx)
     local estado     = ESTADO_OCIOSO
 
     local ggPendente         = false
+    local ggJaAvisado        = false -- evita mandar "GG mano!" duas vezes pro mesmo preso
     local ultimoEvento       = 0
     local semPresosAtivo     = false
     local listaVaziaContagem = 0
@@ -447,6 +448,7 @@ local function load(ctx)
         log('Proposta enviada para ' .. tostring(nomeAtual) .. ' (R$' .. tostring(valorAtual) .. '). Aguardando resposta...')
         estado = ESTADO_RESULTADO
         ggPendente = true
+        ggJaAvisado = false
         marcarEvento()
         local meuGen = dialogGen
 
@@ -465,8 +467,18 @@ local function load(ctx)
         ggPendente = false
 
         if textoDialog:find(TITULO_CONVERSA_DETENTO, 1, true) then
-            log(tostring(nomeAtual) .. ' ACEITOU a reducao!')
-            lua_thread.create(function() wait(300); pcall(sampSendChat, 'GG mano!') end)
+            -- fallback: normalmente o log + "GG mano!" ja foram mandados
+            -- antes, na hora certa, pelo onServerMessage (mensagem
+            -- "iniciou uma conversa privada com o advogado <nick>"). So
+            -- faz aqui se por algum motivo aquela deteccao via chat nao
+            -- rolou (evita log/mensagem duplicados).
+            if not ggJaAvisado then
+                ggJaAvisado = true
+                log(tostring(nomeAtual) .. ' ACEITOU a reducao!')
+                lua_thread.create(function() wait(300); pcall(sampSendChat, 'GG mano!') end)
+            else
+                dbg(tostring(nomeAtual) .. ' ACEITOU (dialog de encerramento, ja avisado antes via chat).')
+            end
         elseif cancelada then
             log(tostring(nomeAtual) .. ' recusou a proposta (Proposta Cancelada).')
         else
@@ -545,9 +557,17 @@ local function load(ctx)
     -- Watchdog generico de inatividade (extra, pedido do usuario): roda
     -- em paralelo aos watchdogs pontuais por etapa (agendarWatchdog). Se
     -- nada acontecer por WATCHDOG_IDLE_LIMIT, forca um novo ciclo. A
-    -- cada WATCHDOG_CACHE_CICLOS ticks tambem faz limpeza defensiva de
-    -- memoria (reset de tabelas que possam crescer sem limite +
-    -- collectgarbage), pra rotina rodando por horas nao acumular lixo.
+    -- cada WATCHDOG_CACHE_CICLOS ticks tambem reseta a tabela
+    -- presosTentados se ela crescer demais, pra rotina rodando por
+    -- horas nao acumular memoria indefinidamente.
+    --
+    -- IMPORTANTE: NAO chamar collectgarbage() manualmente aqui dentro.
+    -- Isso ja causou um crash real ("cannot resume non-suspended
+    -- coroutine") -- collectgarbage('collect') de dentro de uma
+    -- coroutine criada por lua_thread.create bagunca o escalonador
+    -- interno de wait() do MoonLoader e derruba o script inteiro. O
+    -- Lua/LuaJIT ja faz coleta incremental sozinho; resetar a tabela
+    -- que poderia crescer sem limite (abaixo) e suficiente.
     function M.watchdog()
         if watchdogAtivo then return end
         watchdogAtivo = true
@@ -573,8 +593,6 @@ local function load(ctx)
                     dbg('Watchdog: cache de presosTentados grande (' .. n .. '), limpando por seguranca.')
                     presosTentados = {}
                 end
-                collectgarbage('collect')
-                dbg('Watchdog: limpeza periodica de memoria concluida.')
             end
         end
         watchdogAtivo = false
@@ -622,8 +640,16 @@ local function load(ctx)
 
     -- Handler de onServerMessage: o contrato do loader chama
     -- ADV.onServerMessage sempre (ShoxFarm.lua linha ~333), entao essa
-    -- funcao precisa existir. Usada como confirmacao alternativa via
-    -- chat de que o preso aceitou a conversa.
+    -- funcao precisa existir.
+    --
+    -- Esse e o momento CERTO de mandar "GG mano!": quando o servidor
+    -- manda a mensagem "* O preso <nome> iniciou uma conversa privada
+    -- com o advogado <seu nick>." -- isso chega na hora em que o preso
+    -- de fato aceita, bem antes do dialog "A conversa... terminou!"
+    -- (que so aparece quando a conversa acaba, podendo demorar). A
+    -- deteccao pelo dialog em processarResultado continua existindo,
+    -- mas so como fallback (guardado por ggJaAvisado) caso essa
+    -- mensagem de chat nao chegue por algum motivo.
     function M.onServerMessage(color, text)
         local limpo = U.strip(text)
         if rodando and ggPendente then
@@ -638,6 +664,11 @@ local function load(ctx)
                 if match then
                     dbg('Confirmacao de conversa via chat detectada.')
                     ggPendente = false
+                    if not ggJaAvisado then
+                        ggJaAvisado = true
+                        log(tostring(nomeAtual) .. ' ACEITOU a reducao!')
+                        pcall(sampSendChat, 'GG mano!')
+                    end
                 end
             end
         end
