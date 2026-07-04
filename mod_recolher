@@ -63,8 +63,6 @@ local function load(ctx)
         end
     end
 
-    local function titulo(prefixo, nomeDroga) return prefixo .. " " .. nomeDroga end
-
     local function estoqueZerado(textoDialog)
         if not textoDialog then return false end
         local qtd = textoDialog:match("possui%s+(%d+)%s*g")
@@ -111,8 +109,23 @@ local function load(ctx)
 
         if not droga then return false end
 
-        -- Dialog principal do territorio
-        if tituloLimpo == CFG.tituloTerritorio then
+        -- ====================================================================
+        -- IMPORTANTE: identificamos o TIPO do dialog pelo "style" do SA-MP,
+        -- nao pelo texto do titulo. O servidor as vezes manda titulo errado
+        -- (ex: "Pegar Crack" ao pegar LSD), mas o style nunca mente:
+        --   style 4 ou 5 = lista (tablist)  -> menu do territorio
+        --   style 1      = input            -> caixa de digitar quantidade
+        -- Combinado com "estado" (que so o nosso script controla), isso fica
+        -- imune a qualquer bug de rotulo/texto que o servidor mandar.
+        -- ====================================================================
+
+        -- Dialog de LISTA (menu do territorio) -> escolher pegar/esconder
+        -- Exigimos tambem o titulo aqui porque esse titulo especifico
+        -- ("Territorio Gangster") nunca veio errado nos testes -- so os
+        -- sub-dialogs de Pegar/Esconder vieram com titulo trocado. Assim
+        -- evitamos suprimir por engano uma lista de OUTRO menu que nao
+        -- seja o nosso territorio (o que travaria aquele dialog sem resposta).
+        if (style == 4 or style == 5) and tituloLimpo == CFG.tituloTerritorio then
             marcaTerritorio = getGameTimer()
             if estado == ESTADO.AGUARDANDO_F1 then
                 lua_thread.create(function()
@@ -131,46 +144,62 @@ local function load(ctx)
                 end)
                 return true
             end
-            return true
+            -- Titulo bate mas estado nao e o esperado (dessincronia) ->
+            -- nao suprime sem responder; deixa passar pro jogo/usuario tratar.
+            rec_log("Aviso: dialog do territorio chegou em estado inesperado (" .. tostring(estado) .. "), ignorando.")
+            return false
         end
 
-        -- Dialog input PEGAR
-        -- OBS: o servidor pode mandar o titulo errado (ex: "Pegar Crack" ao pegar LSD),
-        -- entao nao confiamos no titulo aqui, so no estado atual (so existe 1 dialog possivel nesse ponto).
-        if estado == ESTADO.AGUARDANDO_PEGAR and tituloLimpo:match("^Pegar ") then
-            if estoqueZerado(textoDialog) then
-                rec_chat("Estoque insuficiente de " .. droga.nome .. " (menos de 100g)! Parando.")
-                lua_thread.create(function() wait(200); sampSendDialogResponse(dialogId, 0, 0, "") end)
-                stop(nil); return true
+        -- Dialog de INPUT (digitar quantidade) -> pode ser PEGAR ou ESCONDER
+        -- Nao confiamos no titulo aqui (e onde o servidor erra), mas exigimos
+        -- que o texto mencione "quantidade" como checagem minima de sanidade,
+        -- pra nao sequestrar algum outro input sem relacao que apareca por
+        -- coincidencia enquanto o script esta ativo.
+        local pareceInputDeQuantidade = textoDialog and textoDialog:lower():find("quantidade", 1, true)
+        if style == 1 and pareceInputDeQuantidade then
+            -- Fase PEGAR
+            if estado == ESTADO.AGUARDANDO_PEGAR then
+                if estoqueZerado(textoDialog) then
+                    rec_chat("Estoque insuficiente de " .. droga.nome .. " (menos de 100g)! Parando.")
+                    lua_thread.create(function() wait(200); sampSendDialogResponse(dialogId, 0, 0, "") end)
+                    stop(nil); return true
+                end
+                lua_thread.create(function()
+                    if gen ~= meuGen or not ativo then return end
+                    wait(CFG.waitAposDialogPegar)
+                    if gen ~= meuGen or not ativo then return end
+                    sampSendDialogResponse(dialogId, 1, 0, CFG.quantidade)
+                    wait(CFG.waitAposEnter)
+                    if gen ~= meuGen or not ativo then return end
+                    estado = ESTADO.AGUARDANDO_F2
+                    abrirTerritorio(meuGen, ESTADO.AGUARDANDO_F2)
+                end)
+                return true
             end
-            lua_thread.create(function()
-                if gen ~= meuGen or not ativo then return end
-                wait(CFG.waitAposDialogPegar)
-                if gen ~= meuGen or not ativo then return end
-                sampSendDialogResponse(dialogId, 1, 0, CFG.quantidade)
-                wait(CFG.waitAposEnter)
-                if gen ~= meuGen or not ativo then return end
-                estado = ESTADO.AGUARDANDO_F2
-                abrirTerritorio(meuGen, ESTADO.AGUARDANDO_F2)
-            end)
-            return true
-        end
 
-        -- Dialog input ESCONDER
-        -- Mesmo caso do "Pegar": nao confiamos no titulo, so no estado atual.
-        if estado == ESTADO.AGUARDANDO_ESCONDER and tituloLimpo:match("^Esconder ") then
-            lua_thread.create(function()
-                if gen ~= meuGen or not ativo then return end
-                wait(CFG.waitAposDialogEsconder)
-                if gen ~= meuGen or not ativo then return end
-                sampSendDialogResponse(dialogId, 1, 0, CFG.quantidade)
-                ciclos = ciclos + 1
-                rec_log("Ciclo " .. ciclos .. "/" .. CFG.maxCiclos .. " concluido! [" .. droga.nome .. "]")
-                if ciclos >= CFG.maxCiclos then stop("Meta atingida!"); return end
-                fase = "pegar"; estado = ESTADO.AGUARDANDO_F1
-                wait(CFG.waitAposEnter); abrirTerritorio(meuGen, ESTADO.AGUARDANDO_F1)
-            end)
-            return true
+            -- Fase ESCONDER
+            if estado == ESTADO.AGUARDANDO_ESCONDER then
+                lua_thread.create(function()
+                    if gen ~= meuGen or not ativo then return end
+                    wait(CFG.waitAposDialogEsconder)
+                    if gen ~= meuGen or not ativo then return end
+                    sampSendDialogResponse(dialogId, 1, 0, CFG.quantidade)
+                    ciclos = ciclos + 1
+                    rec_log("Ciclo " .. ciclos .. "/" .. CFG.maxCiclos .. " concluido! [" .. droga.nome .. "]")
+                    if ciclos >= CFG.maxCiclos then stop("Meta atingida!"); return end
+                    fase = "pegar"; estado = ESTADO.AGUARDANDO_F1
+                    wait(CFG.waitAposEnter); abrirTerritorio(meuGen, ESTADO.AGUARDANDO_F1)
+                end)
+                return true
+            end
+
+            -- Nenhuma fase bateu (estado inesperado) -> nao suprime sem responder.
+            rec_log("Aviso: dialog de input chegou em estado inesperado (" .. tostring(estado) .. "), ignorando.")
+            return false
+        elseif style == 1 then
+            -- Era um input, mas nao tinha "quantidade" no texto -> nao e o nosso.
+            rec_log("Aviso: dialog de input sem 'quantidade' no texto, ignorando (nao e nosso).")
+            return false
         end
 
         return false
