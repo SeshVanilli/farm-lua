@@ -36,12 +36,19 @@ local function load(ctx)
             dialogRecebido  = false
             pendingDialogId = nil
 
-            U.user32.keybd_event(U.VK_Y, 0, 0, 0)
-            while ativo and not dialogRecebido do
-                wait(PROD_HOLD_INTERVAL)
+            -- Trava global (compartilhada com mod_advogado/mod_recolher):
+            -- evita colisao de tecla sintetica com outro modulo, suspeito
+            -- real de crash nativo neste servidor. Segura a trava durante
+            -- todo o "hold" da tecla Y, ja que so um modulo deve estar
+            -- ativo por vez (ctx.pararOutros garante isso no start()).
+            U.comTravaTeclado(function()
                 U.user32.keybd_event(U.VK_Y, 0, 0, 0)
-            end
-            U.user32.keybd_event(U.VK_Y, 0, U.KEYEVENTF_KEYUP, 0)
+                while ativo and not dialogRecebido do
+                    wait(PROD_HOLD_INTERVAL)
+                    U.user32.keybd_event(U.VK_Y, 0, 0, 0)
+                end
+                U.user32.keybd_event(U.VK_Y, 0, U.KEYEVENTF_KEYUP, 0)
+            end)
 
             if not ativo then break end
 
@@ -67,13 +74,23 @@ local function load(ctx)
 
     function M.start()
         if ativo then return end
+        if ctx.pararOutros then ctx.pararOutros('PROD') end
         ativo = true
         lua_thread.create(loopProduzir)
     end
 
     function M.stop(motivo)
+        -- IMPORTANTE: antes mandava um keyup direto aqui, SEM trava,
+        -- podendo colidir com o loopProduzir (que está dentro da trava
+        -- de teclado) se o usuário clicasse "Parar" no painel exatamente
+        -- durante um keydown/keyup da tecla Y — dois keybd_event nativos
+        -- concorrentes na mesma tecla é suspeito real de crash sem erro
+        -- de Lua. M.stop pode ser chamado da thread de render da GUI
+        -- (onde wait() não é seguro), então NÃO tocamos em keybd_event
+        -- aqui: só marcamos ativo=false. O próprio loopProduzir, que já
+        -- está dentro da trava, nota isso em até 50ms e solta a tecla
+        -- com segurança sozinho.
         ativo = false
-        U.user32.keybd_event(U.VK_Y, 0, U.KEYEVENTF_KEYUP, 0)
         if motivo then print('[AutoProduzir] ' .. motivo) end
     end
 
