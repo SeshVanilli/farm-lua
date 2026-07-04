@@ -742,6 +742,7 @@ local function load(ctx)
     -- mesmo dialogId ao mesmo tempo.
     function M.enableJuntar()
         if ST.abrir.active then disableMode('abrir', 'Trocando para modo Juntar.') end
+        if ctx.pararOutros then ctx.pararOutros('CAIXAS') end
         ST.juntar = newModeState()
         ST.juntar.active = true
         dialogGen = 0; genCounter = 0
@@ -751,6 +752,7 @@ local function load(ctx)
 
     function M.enableAbrir()
         if ST.juntar.active then disableMode('juntar', 'Trocando para modo Abrir.') end
+        if ctx.pararOutros then ctx.pararOutros('CAIXAS') end
         ST.abrir = newModeState()
         ST.abrir.active = true
         dialogGen = 0; genCounter = 0
