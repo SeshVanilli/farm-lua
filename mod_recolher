@@ -158,10 +158,16 @@ local function load(ctx)
 
         -- Dialog de INPUT (digitar quantidade) -> pode ser PEGAR ou ESCONDER
         -- Nao confiamos no titulo aqui (e onde o servidor erra), mas exigimos
-        -- que o texto mencione "quantidade" como checagem minima de sanidade,
-        -- pra nao sequestrar algum outro input sem relacao que apareca por
-        -- coincidencia enquanto o script esta ativo.
-        local pareceInputDeQuantidade = textoDialog and textoDialog:lower():find("quantidade", 1, true)
+        -- que o texto mencione "quantidade" OU "quantia" como checagem minima
+        -- de sanidade, pra nao sequestrar algum outro input sem relacao que
+        -- apareca por coincidencia enquanto o script esta ativo.
+        -- ACHADO EM TESTE REAL: na tela de ESCONDER o servidor manda
+        -- "Digite a quantia de <droga> em gramas" (sem o "-de" final), nao
+        -- "quantidade" como na tela de PEGAR. So checar "quantidade" fazia
+        -- o dialog de Esconder ser ignorado e a automacao travar ali.
+        local textoLower = textoDialog and textoDialog:lower() or ''
+        local pareceInputDeQuantidade = textoLower:find("quantidade", 1, true)
+            or textoLower:find("quantia", 1, true)
         if style == 1 and pareceInputDeQuantidade then
             -- Fase PEGAR
             if estado == ESTADO.AGUARDANDO_PEGAR then
