@@ -54,13 +54,19 @@ local function load(ctx)
     local function rec_log(msg)   print('[RecolherDrogas] ' .. msg) end
     local function rec_chat(msg)  U.log('RecolherDrogas', msg, 0xFFAA00) end
 
+    -- Trava global (compartilhada com mod_advogado/mod_produzir): evita
+    -- que 2 módulos mandem tecla sintética ao mesmo tempo, o que é
+    -- suspeito real de crash nativo neste servidor (dialogs todos
+    -- reciclam o mesmo ID 32700).
     local function pressF()
-        if setVirtualKeyDown then
-            setVirtualKeyDown(U.VK_F, true); wait(80); setVirtualKeyDown(U.VK_F, false)
-        else
-            U.user32.keybd_event(U.VK_F, 0, 0, 0); wait(80)
-            U.user32.keybd_event(U.VK_F, 0, U.KEYEVENTF_KEYUP, 0)
-        end
+        U.comTravaTeclado(function()
+            if setVirtualKeyDown then
+                setVirtualKeyDown(U.VK_F, true); wait(80); setVirtualKeyDown(U.VK_F, false)
+            else
+                U.user32.keybd_event(U.VK_F, 0, 0, 0); wait(80)
+                U.user32.keybd_event(U.VK_F, 0, U.KEYEVENTF_KEYUP, 0)
+            end
+        end)
     end
 
     local function estoqueZerado(textoDialog)
@@ -211,6 +217,7 @@ local function load(ctx)
     function M.iniciarDroga(num)
         if ativo then stop("Parado manualmente."); return end
         if not DROGAS[num] then return end
+        if ctx.pararOutros then ctx.pararOutros('REC') end
         gen = gen + 1
         local meuGen = gen
         drogaAtual = num; fase = "pegar"; ciclos = 0
