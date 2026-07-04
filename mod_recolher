@@ -135,7 +135,9 @@ local function load(ctx)
         end
 
         -- Dialog input PEGAR
-        if tituloLimpo == titulo("Pegar", droga.nome) and estado == ESTADO.AGUARDANDO_PEGAR then
+        -- OBS: o servidor pode mandar o titulo errado (ex: "Pegar Crack" ao pegar LSD),
+        -- entao nao confiamos no titulo aqui, so no estado atual (so existe 1 dialog possivel nesse ponto).
+        if estado == ESTADO.AGUARDANDO_PEGAR and tituloLimpo:match("^Pegar ") then
             if estoqueZerado(textoDialog) then
                 rec_chat("Estoque insuficiente de " .. droga.nome .. " (menos de 100g)! Parando.")
                 lua_thread.create(function() wait(200); sampSendDialogResponse(dialogId, 0, 0, "") end)
@@ -155,7 +157,8 @@ local function load(ctx)
         end
 
         -- Dialog input ESCONDER
-        if tituloLimpo == titulo("Esconder", droga.nome) and estado == ESTADO.AGUARDANDO_ESCONDER then
+        -- Mesmo caso do "Pegar": nao confiamos no titulo, so no estado atual.
+        if estado == ESTADO.AGUARDANDO_ESCONDER and tituloLimpo:match("^Esconder ") then
             lua_thread.create(function()
                 if gen ~= meuGen or not ativo then return end
                 wait(CFG.waitAposDialogEsconder)
