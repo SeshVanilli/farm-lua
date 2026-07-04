@@ -40,26 +40,61 @@ function M.jitter(base, range)
     return base + math.random(0, range)
 end
 
+-- ===================================================================
+--  TRAVA GLOBAL DE TECLADO (compartilhada entre TODOS os módulos)
+--  Impede que 2 módulos (ou 2 threads) chamem keybd_event/
+--  setVirtualKeyDown ao mesmo tempo. Isso é suspeito real de crash
+--  nativo: o SA-MP recicla o mesmo ID de dialog (32700) pra tudo, e
+--  2 teclas sintéticas simultâneas enquanto um dialog está abrindo/
+--  fechando pode corromper o estado interno do client e derrubar o
+--  processo sem gerar nenhum erro de Lua (por isso não aparece nada
+--  no moonloader.log antes do crash).
+-- ===================================================================
+local travaTeclado = false
+
+function M.comTravaTeclado(fn)
+    local esperas = 0
+    while travaTeclado do
+        wait(50)
+        esperas = esperas + 1
+        if esperas > 100 then break end -- ~5s, nao trava pra sempre por seguranca
+    end
+    travaTeclado = true
+    local ok, err = pcall(fn)
+    travaTeclado = false
+    if not ok then
+        print('[ShoxFarm][ERRO tecla] ' .. tostring(err))
+    end
+end
+
 function M.pressKey(vk)
-    M.user32.keybd_event(vk, 0, 0, 0)
-    wait(60)
-    M.user32.keybd_event(vk, 0, M.KEYEVENTF_KEYUP, 0)
+    M.comTravaTeclado(function()
+        M.user32.keybd_event(vk, 0, 0, 0)
+        wait(60)
+        M.user32.keybd_event(vk, 0, M.KEYEVENTF_KEYUP, 0)
+    end)
 end
 
 function M.pressKeyN()
-    if setVirtualKeyDown then
-        setVirtualKeyDown(M.VK_N, true); wait(60); setVirtualKeyDown(M.VK_N, false)
-    else
-        M.pressKey(M.VK_N)
-    end
+    M.comTravaTeclado(function()
+        if setVirtualKeyDown then
+            setVirtualKeyDown(M.VK_N, true); wait(60); setVirtualKeyDown(M.VK_N, false)
+        else
+            M.user32.keybd_event(M.VK_N, 0, 0, 0); wait(60)
+            M.user32.keybd_event(M.VK_N, 0, M.KEYEVENTF_KEYUP, 0)
+        end
+    end)
 end
 
 function M.pressKeyEsc()
-    if setVirtualKeyDown then
-        setVirtualKeyDown(M.VK_ESCAPE, true); wait(60); setVirtualKeyDown(M.VK_ESCAPE, false)
-    else
-        M.pressKey(M.VK_ESCAPE)
-    end
+    M.comTravaTeclado(function()
+        if setVirtualKeyDown then
+            setVirtualKeyDown(M.VK_ESCAPE, true); wait(60); setVirtualKeyDown(M.VK_ESCAPE, false)
+        else
+            M.user32.keybd_event(M.VK_ESCAPE, 0, 0, 0); wait(60)
+            M.user32.keybd_event(M.VK_ESCAPE, 0, M.KEYEVENTF_KEYUP, 0)
+        end
+    end)
 end
 
 function M.colorBtn(label, w, h, r,g,b, rh,gh,bh)
