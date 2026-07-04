@@ -139,44 +139,32 @@ local function load(ctx)
     -- pra receber 2 teclas fisicas simultaneas vindas de threads
     -- diferentes). A trava garante que so uma simulacao de tecla roda
     -- por vez em todo o modulo.
-    local teclaEmUso = false
-
-    local function aguardarTravaDeTecladoLivre()
-        local esperas = 0
-        while teclaEmUso do
-            wait(50)
-            esperas = esperas + 1
-            if esperas > 100 then -- ~5s: nao trava pra sempre por seguranca
-                dbg('Trava de teclado presa ha muito tempo, forcando liberacao.')
-                teclaEmUso = false
-                break
-            end
-        end
-    end
-
+    -- NOTA: a trava de teclado agora é GLOBAL (mod_utils.comTravaTeclado),
+    -- compartilhada com mod_produzir e mod_recolher. Antes essa trava só
+    -- protegia dentro do próprio mod_advogado; se outro módulo mandasse
+    -- tecla ao mesmo tempo (ex: usuário trocando de automação sem parar a
+    -- anterior), as duas teclas sintéticas colidiam sem proteção nenhuma —
+    -- suspeito real de crash nativo (ver ctx.pararOutros no loader).
     local function simularTeclaF()
-        aguardarTravaDeTecladoLivre()
-        teclaEmUso = true
-        dbg('Enviando tecla F...')
-        U.user32.keybd_event(U.VK_F, 0, 0, 0); wait(80)
-        U.user32.keybd_event(U.VK_F, 0, U.KEYEVENTF_KEYUP, 0); wait(50)
-        teclaEmUso = false
+        U.comTravaTeclado(function()
+            dbg('Enviando tecla F...')
+            U.user32.keybd_event(U.VK_F, 0, 0, 0); wait(80)
+            U.user32.keybd_event(U.VK_F, 0, U.KEYEVENTF_KEYUP, 0); wait(50)
+        end)
     end
     local function simularTeclaEnter()
-        aguardarTravaDeTecladoLivre()
-        teclaEmUso = true
-        dbg('Enviando tecla ENTER...')
-        U.user32.keybd_event(U.VK_RETURN, 0, 0, 0); wait(80)
-        U.user32.keybd_event(U.VK_RETURN, 0, U.KEYEVENTF_KEYUP, 0); wait(50)
-        teclaEmUso = false
+        U.comTravaTeclado(function()
+            dbg('Enviando tecla ENTER...')
+            U.user32.keybd_event(U.VK_RETURN, 0, 0, 0); wait(80)
+            U.user32.keybd_event(U.VK_RETURN, 0, U.KEYEVENTF_KEYUP, 0); wait(50)
+        end)
     end
     local function simularTeclaEsc()
-        aguardarTravaDeTecladoLivre()
-        teclaEmUso = true
-        dbg('Enviando tecla ESC...')
-        U.user32.keybd_event(U.VK_ESCAPE, 0, 0, 0); wait(80)
-        U.user32.keybd_event(U.VK_ESCAPE, 0, U.KEYEVENTF_KEYUP, 0); wait(50)
-        teclaEmUso = false
+        U.comTravaTeclado(function()
+            dbg('Enviando tecla ESC...')
+            U.user32.keybd_event(U.VK_ESCAPE, 0, 0, 0); wait(80)
+            U.user32.keybd_event(U.VK_ESCAPE, 0, U.KEYEVENTF_KEYUP, 0); wait(50)
+        end)
     end
 
     -- ==================== NUCLEO: AGUARDAR TITULO ANTES DE AGIR ====================
@@ -565,6 +553,7 @@ local function load(ctx)
 
     function M.start(percentual)
         if rodando then log('Ja rodando. F10 para parar.'); return end
+        if ctx.pararOutros then ctx.pararOutros('ADV') end
         rodando = true
         percentualAtual = percentual
         presosTentados = {}
