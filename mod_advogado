@@ -131,6 +131,779 @@ local function load(ctx)
     end
 
     -- ==================== SIMULACAO DE TECLAS ====================
+    -- Trava simples: o modulo dispara varias lua_threads em paralelo
+    -- (ciclo normal, watchdog de inatividade, fechamento de dialog
+    -- pendente...) e mais de uma podia, em teoria, cair no keybd_event
+    -- exatamente ao mesmo tempo. Isso e um suspeito real pra
+    -- instabilidade nativa (o hook de input do SA-MP nao foi feito
+    -- pra receber 2 teclas fisicas simultaneas vindas de threads
+    -- diferentes). A trava garante que so uma simulacao de tecla roda
+    -- por vez em todo o modulo.
+    local teclaEmUso = false
+
+    local function aguardarTravaDeTecladoLivre()
+        local esperas = 0
+        while teclaEmUso do
+            wait(50)
+            esperas = esperas + 1
+            if esperas > 100 then -- ~5s: nao trava pra sempre por seguranca
+                dbg('Trava de teclado presa ha muito tempo, forcando liberacao.')
+                teclaEmUso = false
+                break
+            end
+        end
+    end
+
+    local function simularTeclaF()
+        aguardarTravaDeTecladoLivre()
+        teclaEmUso = true
+        dbg('Enviando tecla F...')
+        U.user32.keybd_event(U.VK_F, 0, 0, 0); wait(80)
+        U.user32.keybd_event(U.VK_F, 0, U.KEYEVENTF_KEYUP, 0); wait(50)
+        teclaEmUso = false
+    end
+    local function simularTeclaEnter()
+        aguardarTravaDeTecladoLivre()
+        teclaEmUso = true
+        dbg('Enviando tecla ENTER...')
+        U.user32.keybd_event(U.VK_RETURN, 0, 0, 0); wait(80)
+        U.user32.keybd_event(U.VK_RETURN, 0, U.KEYEVENTF_KEYUP, 0); wait(50)
+        teclaEmUso = false
+    end
+    local function simularTeclaEsc()
+        aguardarTravaDeTecladoLivre()
+        teclaEmUso = true
+        dbg('Enviando tecla ESC...')
+        U.user32.keybd_event(U.VK_ESCAPE, 0, 0, 0); wait(80)
+        U.user32.keybd_event(U.VK_ESCAPE, 0, U.KEYEVENTF_KEYUP, 0); wait(50)
+        teclaEmUso = false
+    end
+
+    -- ==================== NUCLEO: AGUARDAR TITULO ANTES DE AGIR ====================
+    -- (identico ao v2.8: nunca clica/confirma sem antes checar que o
+    -- dialog certo, com o titulo certo, ainda esta ativo no client)
+    local function aguardarTituloEAgir(dialogId, meuGen, tituloEsperado, label, acao, maxTentativas)
+        maxTentativas = maxTentativas or MAX_TENTATIVAS_TITULO
+        wait(DELAY_PADRAO)
+        for tentativa = 1, maxTentativas do
+            if not rodando then return false end
+            if not dialogAindaAtivo(dialogId, meuGen) then
+                dbg('Dialog "' .. label .. '" sumiu antes de confirmar titulo. Abortando.')
+                return false
+            end
+            if tituloAtualContem(tituloEsperado) then
+                dbg('Titulo "' .. tituloEsperado .. '" confirmado p/ "' .. label .. '" (tent.' .. tentativa .. '). Executando...')
+                acao()
+                return true
+            end
+            dbg('Aguardando titulo "' .. tituloEsperado .. '" p/ "' .. label .. '" (tent.' .. tentativa .. '/' .. maxTentativas .. ')...')
+            wait(DELAY_PADRAO)
+        end
+        dbg('Nao confirmou titulo "' .. tituloEsperado .. '" p/ "' .. label .. '". Desistindo.')
+        return false
+    end
+
+    local function responderComTituloConfirmado(dialogId, meuGen, tituloEsperado, response, listitem, inputtext, label)
+        return aguardarTituloEAgir(dialogId, meuGen, tituloEsperado, label, function()
+            local ok, err = pcall(sampSendDialogResponse, dialogId, response, listitem, inputtext or '')
+            if not ok then dbg('Erro ao responder "' .. label .. '": ' .. tostring(err)) end
+        end)
+    end
+
+    local function fecharComCerteza(dialogId, meuGen, tituloEsperado, label, maxTentativas)
+        maxTentativas = maxTentativas or MAX_TENTATIVAS_FECHAR
+        if not HAS_DIALOG_GUARD then
+            wait(DELAY_PADRAO); simularTeclaEnter(); wait(DELAY_PADRAO)
+            pcall(sampSendDialogResponse, dialogId, 1, 0, '')
+            return true
+        end
+
+        -- FOLGA INICIAL (mesma razao da aguardarTituloEAgir, correcao
+        -- v2.2 do script original): o onShowDialog dispara de forma
+        -- sincrona no instante em que o CLIENT recebe o dialog, mas
+        -- sampIsDialogActive/sampGetCurrentDialogId (SAMPFUNCS, estado
+        -- interno do CDialog do jogo) podem levar uma fracao de segundo
+        -- a mais pra refletir esse dialog como "ativo". Sem essa folga,
+        -- a PRIMEIRA dialogAindaAtivo() logo abaixo corre na mesma
+        -- sincronia do evento, ve o dialog como "ainda nao ativo" e
+        -- fecharComCerteza desiste na hora (return true, achando que ja
+        -- fechou sozinho) sem nunca mandar o ENTER -- foi exatamente
+        -- isso que travou o dialog "Proposta Cancelada" na tela: ele
+        -- continuava genuinamente aberto, so a leitura do estado interno
+        -- que ainda nao tinha assentado.
+        wait(DELAY_PADRAO)
+
+        for tentativa = 1, maxTentativas do
+            if not rodando then return true end
+            if not dialogAindaAtivo(dialogId, meuGen) then return true end
+            if not tituloAtualContem(tituloEsperado) then
+                dbg('Aguardando titulo "' .. tituloEsperado .. '" assentar p/ fechar "' .. label .. '" (tent.' .. tentativa .. ')...')
+                wait(DELAY_PADRAO)
+            else
+                dbg('Fechando "' .. label .. '" via ENTER (tent.' .. tentativa .. '/' .. maxTentativas .. ')...')
+                simularTeclaEnter(); wait(DELAY_PADRAO)
+                if not dialogAindaAtivo(dialogId, meuGen) then return true end
+                if tituloAtualContem(tituloEsperado) then
+                    local resposta = (tentativa % 2 == 1) and 1 or 0
+                    pcall(sampSendDialogResponse, dialogId, resposta, 0, '')
+                    wait(DELAY_PADRAO)
+                end
+            end
+        end
+        if not dialogAindaAtivo(dialogId, meuGen) then return true end
+        dbg('Nao consegui confirmar fechamento de "' .. label .. '" apos ' .. maxTentativas .. ' tentativas.')
+        return false
+    end
+
+    -- fecha um dialog pendente/travado usando exclusivamente ESC fisico
+    -- (licao da v2.6: sampSendDialogResponse(response=0) nao fechava de
+    -- verdade nesse servidor, e Enter fisico confirma item/valor sem
+    -- querer -- ESC e o unico que so cancela, nunca confirma nada)
+    local function fecharDialogPendente()
+        if not HAS_DIALOG_GUARD then return end
+        wait(DELAY_PADRAO)
+        local ok, ativo = pcall(sampIsDialogActive)
+        if not ok or not ativo then return end
+        local ok2, idAtual = pcall(sampGetCurrentDialogId)
+        if not ok2 or not idAtual then return end
+
+        local tituloNoMomento = dialogAtualTitulo
+        dbg('Dialog ' .. tostring(idAtual) .. ' ("' .. tituloNoMomento .. '") ainda aberto, cancelando com ESC...')
+
+        for tentativa = 1, 2 do
+            if not rodando then return end
+            local okAtivo, ativoAgora = pcall(sampIsDialogActive)
+            if not okAtivo or not ativoAgora then return end
+            if dialogAtualTitulo ~= tituloNoMomento then
+                dbg('Titulo mudou p/ "' .. dialogAtualTitulo .. '" enquanto esperava -- fluxo normal, abortando fechamento forcado.')
+                return
+            end
+            dbg('Cancelando dialog pendente ' .. tostring(idAtual) .. ' com ESC (tent.' .. tentativa .. '/2)...')
+            simularTeclaEsc(); wait(DELAY_PADRAO)
+        end
+    end
+
+    local function extrairNomeDetento(linha)
+        -- pega tudo antes de "(ID:" (nao so caracteres de palavra),
+        -- pra funcionar tambem com sufixos como "(AFK)" que aparecem
+        -- colados no nome antes do "(ID: N)", ex.:
+        --   "zNadsonASST(AFK) (ID: 22)" -> "zNadsonASST(AFK)"
+        --   "gui.spct (ID: 25)"          -> "gui.spct"
+        -- (o regex antigo so aceitava [%w_%.%[%]], que nao inclui
+        -- parenteses -- por isso todo "Nao Ajustado" com "(AFK)" ficava
+        -- com nome=nil e era pulado pra sempre, sem nunca ser tentado)
+        local nome = linha:match('^%s*(.-)%s*%(ID:')
+        if not nome or nome == '' then return nil end
+        return nome
+    end
+
+    local function encontrarProximoPreso(textoDialog)
+        local linhas = {}
+        for linha in (textoDialog .. '\n'):gmatch('(.-)\n') do
+            table.insert(linhas, linha)
+        end
+        for i = 2, #linhas do
+            local linha = linhas[i]
+            if linha:find('Nao Ajustado', 1, true) then
+                local nome = extrairNomeDetento(linha)
+                if nome and not presosTentados[nome] then
+                    return i - 2, nome
+                end
+            end
+        end
+        return nil, nil
+    end
+
+    -- watchdog pontual: agenda 1 checagem unica depois de timeoutMs
+    -- (cobre "o dialog esperado nunca chegou")
+    local function agendarWatchdog(estadoEsperado, meuGen, timeoutMs, aoFalhar)
+        lua_thread.create(function()
+            wait(timeoutMs)
+            if rodando and estado == estadoEsperado and dialogGen == meuGen then
+                aoFalhar()
+            end
+        end)
+    end
+
+    -- ==================== FLUXO PRINCIPAL ====================
+    local tentarAbrirMenu
+    local proximoPreso
+
+    local function marcarTentadoEContinuar(motivo, delayMs)
+        if motivo then log(motivo) end
+        marcarEvento()
+        if nomeAtual then presosTentados[nomeAtual] = true end
+        nomeAtual = nil; valorAtual = nil
+        proximoPreso(delayMs)
+    end
+
+    proximoPreso = function(delayMs)
+        if not rodando then return end
+        estado = ESTADO_OCIOSO
+        lua_thread.create(function()
+            wait(delayMs or DELAY_PADRAO)
+            if rodando then tentarAbrirMenu() end
+        end)
+    end
+
+    tentarAbrirMenu = function()
+        if not rodando then return end
+        estado = ESTADO_LISTA
+        nomeAtual = nil
+        marcarEvento()
+
+        fecharDialogPendente()
+        if not rodando then return end
+
+        local meuGen = dialogGen
+        simularTeclaF()
+
+        agendarWatchdog(ESTADO_LISTA, meuGen, TEMPO_ESPERA_DIALOG, function()
+            tentativasAbertura = tentativasAbertura + 1
+            if tentativasAbertura > MAX_TENTATIVAS_ABERTURA then
+                log('Nao consegui abrir o menu de presos apos ' .. MAX_TENTATIVAS_ABERTURA .. ' tentativas. Parando.')
+                rodando = false; estado = ESTADO_OCIOSO
+                return
+            end
+            dbg('Menu nao abriu (tent.' .. tentativasAbertura .. '/' .. MAX_TENTATIVAS_ABERTURA .. '), tentando F de novo...')
+            tentarAbrirMenu()
+        end)
+    end
+
+    -- ciclo de "sem presos disponiveis" combinado (ver cabecalho do
+    -- arquivo): fase 1 tenta LISTA_VAZIA_TENTATIVAS vezes a cada
+    -- LISTA_VAZIA_DELAY fechando com ESC fisico (metodo confiavel,
+    -- v2.6); esgotadas essas tentativas entra em "modo economia" bem
+    -- mais lento (LISTA_VAZIA_ECONOMIA) e SO ENTAO reseta
+    -- presosTentados, dando chance de presos recusados voltarem a
+    -- ficar elegiveis sem martelar o servidor toda hora.
+    local function semPresosDisponiveis(dialogId)
+        if semPresosAtivo then dbg('Loop de sem-presos ja ativo, ignorando chamada duplicada.'); return end
+        semPresosAtivo = true
+        estado = ESTADO_OCIOSO
+        marcarEvento()
+        local meuGen = dialogGen
+
+        listaVaziaContagem = listaVaziaContagem + 1
+        local delay
+        if listaVaziaContagem <= LISTA_VAZIA_TENTATIVAS then
+            delay = LISTA_VAZIA_DELAY
+            log('Nenhum preso "Nao Ajustado" no momento (tent.' .. listaVaziaContagem .. '/' .. LISTA_VAZIA_TENTATIVAS .. '). Aguardando ' .. (delay/1000) .. 's...')
+        else
+            delay = LISTA_VAZIA_ECONOMIA
+            if listaVaziaContagem == LISTA_VAZIA_TENTATIVAS + 1 then
+                log('Lista esgotada. Modo economia: revisando recusados a cada ' .. (delay/1000) .. 's...')
+                presosTentados = {}
+            else
+                log('Modo economia: aguardando ' .. (delay/1000) .. 's...')
+            end
+        end
+
+        lua_thread.create(function()
+            wait(1000)
+            if not rodando then semPresosAtivo = false; return end
+            if dialogAindaAtivo(dialogId, meuGen) then
+                simularTeclaEsc()
+            end
+            wait(math.max(delay - 1000, 0))
+            semPresosAtivo = false
+            if rodando then tentarAbrirMenu() end
+        end)
+    end
+
+    local function processarListaPresos(dialogId, textoDialog)
+        tentativasAbertura = 0
+        local indice, nome = encontrarProximoPreso(textoDialog)
+        if not indice then
+            semPresosDisponiveis(dialogId)
+            return
+        end
+        listaVaziaContagem = 0
+        nomeAtual = nome
+        estado = ESTADO_PERCENTUAL
+        local meuGen = dialogGen
+
+        lua_thread.create(function()
+            local ok = aguardarTituloEAgir(dialogId, meuGen, TITULO_LISTA, 'lista de presos', function()
+                sampSetCurrentDialogListItem(indice)
+            end)
+            if not ok then marcarTentadoEContinuar(nil); return end
+            wait(DELAY_PADRAO)
+            if responderComTituloConfirmado(dialogId, meuGen, TITULO_LISTA, 1, indice, '', 'lista de presos') then
+                agendarWatchdog(ESTADO_PERCENTUAL, meuGen, TEMPO_ESPERA_DIALOG, function()
+                    marcarTentadoEContinuar('Dialog de porcentagem nao apareceu para ' .. nome .. '. Pulando.')
+                end)
+            else
+                marcarTentadoEContinuar(nil)
+            end
+        end)
+    end
+
+    local function processarPercentual(dialogId)
+        local idxPercent = PERCENT_INDEX[percentualAtual]
+        estado = ESTADO_VALOR
+        local meuGen = dialogGen
+
+        lua_thread.create(function()
+            local ok = aguardarTituloEAgir(dialogId, meuGen, TITULO_PERCENTUAL, 'percentual', function()
+                sampSetCurrentDialogListItem(idxPercent)
+            end)
+            if not ok then marcarTentadoEContinuar(nil); return end
+            wait(DELAY_PADRAO)
+            if responderComTituloConfirmado(dialogId, meuGen, TITULO_PERCENTUAL, 1, idxPercent, '', 'percentual') then
+                agendarWatchdog(ESTADO_VALOR, meuGen, TEMPO_ESPERA_DIALOG, function()
+                    marcarTentadoEContinuar('Dialog de valor nao apareceu para ' .. tostring(nomeAtual) .. '. Pulando.')
+                end)
+            else
+                marcarTentadoEContinuar(nil)
+            end
+        end)
+    end
+
+    local function processarValor(dialogId)
+        valorAtual = VALORES_COBRANCA[math.random(1, #VALORES_COBRANCA)]
+        estado = ESTADO_CONFIRMACAO
+        local meuGen = dialogGen
+        local texto = tostring(valorAtual)
+
+        lua_thread.create(function()
+            local tituloOk = aguardarTituloEAgir(dialogId, meuGen, TITULO_VALOR, 'valor (aguardando edit box)', function() end)
+            if not tituloOk then marcarTentadoEContinuar(nil); return end
+            wait(DELAY_PADRAO)
+            if type(sampSetCurrentDialogEditboxText) == 'function' then
+                pcall(sampSetCurrentDialogEditboxText, texto)
+            elseif type(sampSetDialogText) == 'function' then
+                pcall(sampSetDialogText, texto)
+            end
+            wait(DELAY_PADRAO)
+            if responderComTituloConfirmado(dialogId, meuGen, TITULO_VALOR, 1, 0, texto, 'valor') then
+                agendarWatchdog(ESTADO_CONFIRMACAO, meuGen, TEMPO_ESPERA_DIALOG, function()
+                    marcarTentadoEContinuar('Proposta nao foi enviada para ' .. tostring(nomeAtual) .. '. Pulando.')
+                end)
+            else
+                marcarTentadoEContinuar(nil)
+            end
+        end)
+    end
+
+    local function processarConfirmacao(dialogId)
+        log('Proposta enviada para ' .. tostring(nomeAtual) .. ' (R$' .. tostring(valorAtual) .. '). Aguardando resposta...')
+        estado = ESTADO_RESULTADO
+        ggPendente = true
+        ggJaAvisado = false
+        marcarEvento()
+        local meuGen = dialogGen
+
+        lua_thread.create(function()
+            fecharComCerteza(dialogId, meuGen, TITULO_CONFIRMACAO, 'aguardar', MAX_TENTATIVAS_FECHAR)
+        end)
+
+        agendarWatchdog(ESTADO_RESULTADO, meuGen, TEMPO_ESPERA_RESPOSTA, function()
+            ggPendente = false
+            marcarTentadoEContinuar(tostring(nomeAtual) .. ' nao respondeu em ' .. (TEMPO_ESPERA_RESPOSTA/1000) .. 's.')
+        end)
+    end
+
+    local function processarResultado(dialogId, textoDialog, conteudo)
+        local cancelada = (conteudo or ''):find(TITULO_CANCELADA, 1, true) ~= nil
+        ggPendente = false
+
+        if textoDialog:find(TITULO_CONVERSA_DETENTO, 1, true) then
+            -- fallback: normalmente o log + "GG mano!" ja foram mandados
+            -- antes, na hora certa, pelo onServerMessage (mensagem
+            -- "iniciou uma conversa privada com o advogado <nick>"). So
+            -- faz aqui se por algum motivo aquela deteccao via chat nao
+            -- rolou (evita log/mensagem duplicados).
+            if not ggJaAvisado then
+                ggJaAvisado = true
+                log(tostring(nomeAtual) .. ' ACEITOU a reducao!')
+                lua_thread.create(function() wait(300); pcall(sampSendChat, 'GG mano!') end)
+            else
+                dbg(tostring(nomeAtual) .. ' ACEITOU (dialog de encerramento, ja avisado antes via chat).')
+            end
+        elseif cancelada then
+            log(tostring(nomeAtual) .. ' recusou a proposta (Proposta Cancelada).')
+        else
+            log(tostring(nomeAtual) .. ' recusou ou retornou algo inesperado.')
+        end
+
+        local meuGen = dialogGen
+        local tituloResultado = dialogAtualTitulo
+
+        lua_thread.create(function()
+            fecharComCerteza(dialogId, meuGen, tituloResultado, 'fechar resultado', MAX_TENTATIVAS_FECHAR)
+            marcarTentadoEContinuar(nil, cancelada and (DELAY_PADRAO * 3) or nil)
+        end)
+    end
+
+    local function processarDinheiroInsuficiente(dialogId)
+        dbg('Dialog "Dinheiro Insuficiente" para ' .. tostring(nomeAtual) .. '. Fechando e marcando como tentado.')
+        estado = ESTADO_OCIOSO
+        ggPendente = false
+        local meuGen = dialogGen
+        local tituloAtual = dialogAtualTitulo
+        lua_thread.create(function()
+            fecharComCerteza(dialogId, meuGen, tituloAtual, 'dinheiro insuficiente', MAX_TENTATIVAS_FECHAR)
+            marcarTentadoEContinuar(tostring(nomeAtual) .. ' nao tem saldo suficiente. Pulando.')
+        end)
+    end
+
+    local function processarPropostaCanceladaPrecoce(dialogId)
+        dbg('Dialog "Proposta Cancelada" fora da etapa de resultado para ' .. tostring(nomeAtual) .. '. Fechando e marcando como tentado.')
+        estado = ESTADO_OCIOSO
+        ggPendente = false
+        local meuGen = dialogGen
+        local tituloAtual = dialogAtualTitulo
+        lua_thread.create(function()
+            fecharComCerteza(dialogId, meuGen, tituloAtual, 'proposta cancelada (precoce)', MAX_TENTATIVAS_FECHAR)
+            marcarTentadoEContinuar(tostring(nomeAtual) .. ' ja foi ajustado por outra pessoa. Pulando.')
+        end)
+    end
+
+    -- ==================== API PÚBLICA ====================
+    local M = {}
+
+    function M.start(percentual)
+        if rodando then log('Ja rodando. F10 para parar.'); return end
+        rodando = true
+        percentualAtual = percentual
+        presosTentados = {}
+        tentativasAbertura = 0
+        semPresosAtivo = false
+        listaVaziaContagem = 0
+        ggPendente = false
+        watchdogCiclos = 0
+        marcarEvento()
+        log('Iniciado com ' .. percentual .. '% de reducao.')
+        lua_thread.create(M.watchdog)
+        lua_thread.create(function() wait(100); tentarAbrirMenu() end)
+    end
+
+    function M.stop(motivo)
+        if rodando then
+            rodando = false
+            estado = ESTADO_OCIOSO
+            ggPendente = false
+            log(motivo or 'Rotina interrompida.')
+        end
+        semPresosAtivo = false
+    end
+
+    function M.isRodando() return rodando end
+    function M.isGgPendente() return ggPendente end
+    function M.setGgPendente(v) ggPendente = v end
+    function M.getPlayerNick() return ctx.playerNick end
+    function M.getDialogTitulo() return dialogAtualTitulo end
+    function M.getDialogTexto() return dialogAtualTexto end
+
+    -- Watchdog generico de inatividade (extra, pedido do usuario): roda
+    -- em paralelo aos watchdogs pontuais por etapa (agendarWatchdog). Se
+    -- nada acontecer por WATCHDOG_IDLE_LIMIT, forca um novo ciclo. A
+    -- cada WATCHDOG_CACHE_CICLOS ticks tambem reseta a tabela
+    -- presosTentados se ela crescer demais, pra rotina rodando por
+    -- horas nao acumular memoria indefinidamente.
+    --
+    -- IMPORTANTE: NAO chamar collectgarbage() manualmente aqui dentro.
+    -- Isso ja causou um crash real ("cannot resume non-suspended
+    -- coroutine") -- collectgarbage('collect') de dentro de uma
+    -- coroutine criada por lua_thread.create bagunca o escalonador
+    -- interno de wait() do MoonLoader e derruba o script inteiro. O
+    -- Lua/LuaJIT ja faz coleta incremental sozinho; resetar a tabela
+    -- que poderia crescer sem limite (abaixo) e suficiente.
+    function M.watchdog()
+        if watchdogAtivo then return end
+        watchdogAtivo = true
+        while rodando do
+            wait(WATCHDOG_TICK)
+            if not rodando then break end
+
+            watchdogCiclos = watchdogCiclos + 1
+
+            if getGameTimer() - ultimoEvento > WATCHDOG_IDLE_LIMIT then
+                log('Watchdog: inatividade detectada (' .. (WATCHDOG_IDLE_LIMIT/1000) .. 's sem eventos). Reiniciando ciclo...')
+                marcarEvento()
+                estado = ESTADO_OCIOSO
+                ggPendente = false
+                if rodando then tentarAbrirMenu() end
+            end
+
+            if watchdogCiclos >= WATCHDOG_CACHE_CICLOS then
+                watchdogCiclos = 0
+                local n = 0
+                for _ in pairs(presosTentados) do n = n + 1 end
+                if n > 200 then
+                    dbg('Watchdog: cache de presosTentados grande (' .. n .. '), limpando por seguranca.')
+                    presosTentados = {}
+                end
+            end
+        end
+        watchdogAtivo = false
+    end
+
+    -- Handler principal chamado pelo loader em sampev.onShowDialog.
+    -- Sempre atualiza o snapshot do dialog, mesmo se nao estiver rodando.
+    function M.onShowDialog(dialogId, style, tituloLimpo, textoDialog, conteudo)
+        dialogGen = dialogGen + 1
+        marcarEvento()
+        dialogAtualId     = dialogId
+        dialogAtualTitulo = tituloLimpo
+        dialogAtualTexto  = textoDialog
+
+        if not rodando then return false end
+
+        if debugMode then
+            dbg(('dialog id=%s style=%s title="%s" gen=%d estado=%s')
+                :format(tostring(dialogId), tostring(style), tituloLimpo, dialogGen, estado))
+        end
+
+        if conteudo:find(TITULO_DINHEIRO_INSUFICIENTE, 1, true) then
+            processarDinheiroInsuficiente(dialogId); return false
+        end
+        if estado ~= ESTADO_RESULTADO and conteudo:find(TITULO_CANCELADA, 1, true) then
+            processarPropostaCanceladaPrecoce(dialogId); return false
+        end
+        if estado == ESTADO_LISTA and conteudo:find(TITULO_LISTA, 1, true) then
+            processarListaPresos(dialogId, textoDialog); return false
+        end
+        if estado == ESTADO_PERCENTUAL and conteudo:find(TITULO_PERCENTUAL, 1, true) then
+            processarPercentual(dialogId); return false
+        end
+        if estado == ESTADO_VALOR and conteudo:find(TITULO_VALOR, 1, true) then
+            processarValor(dialogId); return false
+        end
+        if estado == ESTADO_CONFIRMACAO and conteudo:find(TITULO_CONFIRMACAO, 1, true) then
+            processarConfirmacao(dialogId); return false
+        end
+        if estado == ESTADO_RESULTADO then
+            processarResultado(dialogId, textoDialog, conteudo); return false
+        end
+        return false
+    end
+
+    -- Handler de onServerMessage: o contrato do loader chama
+    -- ADV.onServerMessage sempre (ShoxFarm.lua linha ~333), entao essa
+    -- funcao precisa existir.
+    --
+    -- Esse e o momento CERTO de mandar "GG mano!": quando o servidor
+    -- manda a mensagem "* O preso <nome> iniciou uma conversa privada
+    -- com o advogado <seu nick>." -- isso chega na hora em que o preso
+    -- de fato aceita, bem antes do dialog "A conversa... terminou!"
+    -- (que so aparece quando a conversa acaba, podendo demorar). A
+    -- deteccao pelo dialog em processarResultado continua existindo,
+    -- mas so como fallback (guardado por ggJaAvisado) caso essa
+    -- mensagem de chat nao chegue por algum motivo.
+    function M.onServerMessage(color, text)
+        local limpo = U.strip(text)
+        if rodando and ggPendente then
+            local nomeAdv = limpo:match('[Ii]niciou uma conversa privada com o advogado%s+(.-)%s*$') or
+                            limpo:match('[Ii]niciou uma conversa privada com o advogado%s+(.-)[%.!%s]')
+            if nomeAdv and nomeAdv ~= '' then
+                local meuNick = ctx.playerNick or ''
+                local match = (meuNick == '' or meuNick == '...')
+                if not match then
+                    match = nomeAdv:lower():find(meuNick:lower(), 1, true) ~= nil
+                end
+                if match then
+                    dbg('Confirmacao de conversa via chat detectada.')
+                    ggPendente = false
+                    if not ggJaAvisado then
+                        ggJaAvisado = true
+                        log(tostring(nomeAtual) .. ' ACEITOU a reducao!')
+                        pcall(sampSendChat, 'GG mano!')
+                    end
+                end
+            end
+        end
+    end
+
+    -- GUI da aba Advogado (chamada dentro do imgui.OnDrawFrame do loader)
+    function M.drawGui(W)
+        imgui.SetCursorPosX(20)
+        imgui.Text("Porcentagem de Reducao:")
+
+        local bw = W - 40
+        local stepsCount = #percentuais
+
+        imgui.SetCursorPosX(20)
+        local rulerStartX = imgui.GetCursorScreenPos().x
+        local rulerY      = imgui.GetCursorScreenPos().y
+        local drawList    = imgui.GetWindowDrawList()
+        local rulerHeight = 14
+
+        for i = 1, stepsCount do
+            local frac = (i - 1) / (stepsCount - 1)
+            local x = rulerStartX + frac * bw
+            drawList:AddLine(
+                imgui.ImVec2(x, rulerY + rulerHeight - 6),
+                imgui.ImVec2(x, rulerY + rulerHeight),
+                imgui.GetColorU32(imgui.ImVec4(0.75, 0.10, 0.10, 1.0)), 1.5)
+            local label    = tostring(percentuais[i])
+            local textSize = imgui.CalcTextSize(label)
+            imgui.SetCursorScreenPos(imgui.ImVec2(x - textSize.x * 0.5, rulerY))
+            imgui.Text(label)
+        end
+
+        imgui.SetCursorScreenPos(imgui.ImVec2(rulerStartX, rulerY + rulerHeight))
+        imgui.Dummy(imgui.ImVec2(0, 2))
+
+        imgui.SetCursorPosX(20)
+        imgui.PushItemWidth(bw)
+        imgui.SliderFloat("##advperc", percentualIdx, 0, stepsCount - 1, "")
+        imgui.PopItemWidth()
+        local percLabel = percentuais[math.floor(percentualIdx.v) + 1] .. "%"
+        imgui.SetCursorPosX(20)
+        imgui.Text("Reducao selecionada: " .. percLabel)
+        imgui.Text("------------------------------------------------")
+
+        local bh = 44
+        imgui.SetCursorPosX(20)
+        if rodando then
+            if U.colorBtn("  PARAR  ", bw, bh, 0.08,0.55,0.15, 0.10,0.70,0.20) then
+                M.stop("Parado pela GUI.")
+            end
+        else
+            if U.colorBtn("  INICIAR  ", bw, bh, 0.65,0.05,0.05, 0.80,0.10,0.10) then
+                M.start(percentuais[math.floor(percentualIdx.v) + 1])
+            end
+        end
+    end
+
+    return M
+end
+
+return load-- ===================================================================
+--  mod_advogado.lua  –  ShoxFarm módulo AutoAdvogado
+--
+--  Portado do AutoAdvogado.lua standalone v2.8 pro formato modular do
+--  ShoxFarm.lua (loader). Mantém 1:1 a máquina de estados, os métodos
+--  de confirmação de título (aguardarTituloEAgir/fecharComCerteza) e
+--  todas as correções v2.0→v2.8 do script original (dinheiro
+--  insuficiente, proposta cancelada precoce, fechamento por ESC físico
+--  em vez de sampSendDialogResponse, mensagem "GG mano!" no aceite).
+--
+--  Duas coisas foram combinadas/ampliadas por pedido explícito do
+--  usuário (não existiam assim no v2.8 nem no exemplo modular colado
+--  isoladamente):
+--
+--  1) Ciclo de "sem presos disponíveis": usa o fechamento por ESC
+--     físico do v2.8 (único método comprovado que fecha o dialog
+--     nesse servidor — v2.6), mas com o ritmo em 2 fases, mais
+--     paciente, do exemplo modular: algumas tentativas espaçadas antes
+--     de entrar em "modo economia" bem mais lento, e só then reseta a
+--     lista de tentados.
+--
+--  2) Watchdog genérico de inatividade (extra, além dos watchdogs
+--     pontuais por etapa que o v2.8 já tinha): a cada tick também
+--     conta ciclos e, a cada N ciclos, faz uma limpeza defensiva de
+--     memória (reset de tabelas que possam crescer sem limite +
+--     collectgarbage) para rotinas rodando por muitas horas seguidas.
+--
+--  Espera de ctx.U (mod_utils) as seguintes funções/constantes:
+--    U.log(tag, msg, cor), U.user32, U.VK_F, U.VK_RETURN, U.VK_ESCAPE,
+--    U.KEYEVENTF_KEYUP, U.trim, U.strip, U.colorBtn(label,w,h,r,g,b,rh,gh,bh)
+--
+--  Retorna API pública exigida pelo loader ShoxFarm.lua:
+--    { start, stop, isRodando, drawGui, onShowDialog, onServerMessage }
+-- ===================================================================
+
+local function load(ctx)
+    local U     = ctx.U
+    local imgui = require 'imgui'
+
+    -- ==================== CONSTANTES ====================
+    local ESTADO_OCIOSO      = 'ocioso'
+    local ESTADO_LISTA       = 'lista'
+    local ESTADO_PERCENTUAL  = 'percentual'
+    local ESTADO_VALOR       = 'valor'
+    local ESTADO_CONFIRMACAO = 'confirmacao'
+    local ESTADO_RESULTADO   = 'resultado'
+
+    local DELAY_PADRAO            = 1200
+    local TEMPO_ESPERA_DIALOG     = 6000
+    local TEMPO_ESPERA_RESPOSTA   = 15000
+    local MAX_TENTATIVAS_ABERTURA = 5
+    local MAX_TENTATIVAS_TITULO   = 6
+    local MAX_TENTATIVAS_FECHAR   = 5
+    local VALORES_COBRANCA        = {500, 777}
+
+    local PERCENT_INDEX = {
+        [5]=0, [10]=1, [15]=2, [20]=3, [25]=4,
+        [30]=5, [35]=6, [40]=7, [45]=8, [50]=9,
+    }
+    local percentuais = {5,10,15,20,25,30,35,40,45,50}
+
+    local TITULO_LISTA                 = 'Total de Presos'
+    local TITULO_PERCENTUAL            = 'Reduzir Pena'
+    local TITULO_VALOR                 = 'Insira abaixo'
+    local TITULO_CONFIRMACAO           = 'Voce ofereceu'
+    local TITULO_CANCELADA             = 'Proposta Cancelada'
+    local TITULO_DINHEIRO_INSUFICIENTE = 'Dinheiro Insuficiente'
+    local TITULO_CONVERSA_DETENTO      = 'conversa com o detento'
+
+    -- ciclo de "sem presos disponiveis" combinado (ver cabecalho)
+    local LISTA_VAZIA_TENTATIVAS = 3      -- tentativas rapidas antes do modo economia
+    local LISTA_VAZIA_DELAY      = 4000   -- ms entre tentativas na fase 1
+    local LISTA_VAZIA_ECONOMIA   = 10000  -- ms entre tentativas no modo economia (mais devagar)
+
+    -- watchdog generico de inatividade (extra, pedido do usuario)
+    local WATCHDOG_TICK         = 5000
+    local WATCHDOG_IDLE_LIMIT   = 20000
+    local WATCHDOG_CACHE_CICLOS = 10 -- a cada 10 ticks (~50s) faz limpeza defensiva de memoria
+
+    local HAS_DIALOG_GUARD = (type(sampIsDialogActive) == 'function')
+        and (type(sampGetCurrentDialogId) == 'function')
+
+    -- ==================== ESTADO ====================
+    local rodando            = false
+    local debugMode          = true
+    local percentualAtual    = nil
+    local presosTentados     = {}
+    local tentativasAbertura = 0
+
+    local dialogGen          = 0
+    local dialogAtualId      = nil
+    local dialogAtualTitulo  = ''
+    local dialogAtualTexto   = ''
+
+    local nomeAtual  = nil
+    local valorAtual = nil
+    local estado     = ESTADO_OCIOSO
+
+    local ggPendente         = false
+    local ggJaAvisado        = false -- evita mandar "GG mano!" duas vezes pro mesmo preso
+    local ultimoEvento       = 0
+    local semPresosAtivo     = false
+    local listaVaziaContagem = 0
+    local watchdogAtivo      = false
+    local watchdogCiclos     = 0
+
+    -- GUI
+    local percentualIdx = imgui.ImFloat(0)
+
+    -- ==================== HELPERS ====================
+    local function log(msg) U.log('AutoAdvogado', msg, 0x00CFFF) end
+    local function dbg(msg)
+        if debugMode then U.log('ADV.DBG', msg, 0x888888) end
+    end
+    local function marcarEvento() ultimoEvento = getGameTimer() end
+
+    local function dialogAindaAtivo(dialogId, meuGen)
+        if dialogGen ~= meuGen then return false end
+        if not HAS_DIALOG_GUARD then return true end
+        local ok, ativo = pcall(sampIsDialogActive)
+        if not ok or not ativo then return false end
+        local ok2, idAtual = pcall(sampGetCurrentDialogId)
+        if not ok2 then return true end
+        return idAtual == dialogId
+    end
+
+    local function tituloAtualContem(trecho)
+        if dialogAtualTitulo:find(trecho, 1, true) then return true end
+        if dialogAtualTexto:find(trecho, 1, true) then return true end
+        return false
+    end
+
+    -- ==================== SIMULACAO DE TECLAS ====================
     local function simularTeclaF()
         dbg('Enviando tecla F...')
         U.user32.keybd_event(U.VK_F, 0, 0, 0); wait(80)
